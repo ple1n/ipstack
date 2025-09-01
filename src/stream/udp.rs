@@ -11,7 +11,7 @@ use std::{
 use etherparse::{
     Ipv4Extensions, Ipv4Header, Ipv6Extensions, Ipv6Header, TransportHeader, UdpHeader,
 };
-use futures::{Sink, Stream};
+use futures::{FutureExt, Sink, Stream};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
@@ -19,14 +19,14 @@ use tokio::{
 };
 use tracing::info;
 
-use crate::{packet::NetworkPacket, TTL};
+use crate::{PacketRecver, PacketSender, TTL, make_packet_channel, packet::NetworkPacket};
 
 pub struct IpStackUdpStream {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
-    stream_sender: UnboundedSender<NetworkPacket>,
-    stream_receiver: UnboundedReceiver<NetworkPacket>,
-    packet_sender: UnboundedSender<NetworkPacket>,
+    stream_sender: PacketSender,
+    stream_receiver: PacketRecver,
+    packet_sender: PacketSender,
     first_paload: Option<Vec<u8>>,
     timeout: Pin<Box<Sleep>>,
     udp_timeout: Duration,
@@ -40,14 +40,17 @@ impl Stream for IpStackUdpStream {
             return Poll::Ready(None); // todo: return timeout error
         }
         let udp_timeout = self.udp_timeout;
-        match self.stream_receiver.poll_recv(cx) {
-            Poll::Ready(Some(p)) => {
+        match {
+            let mut fut = self.stream_receiver.recv_async();
+            fut.poll_unpin(cx)
+        } {
+            Poll::Ready(Ok(p)) => {
                 self.timeout
                     .as_mut()
                     .reset(tokio::time::Instant::now() + udp_timeout);
                 Poll::Ready(Some(p))
             }
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Err(_)) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -83,11 +86,11 @@ impl IpStackUdpStream {
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
         payload: Vec<u8>,
-        pkt_sender: UnboundedSender<NetworkPacket>,
+        pkt_sender: PacketSender,
         mtu: u16,
         udp_timeout: Duration,
     ) -> Self {
-        let (stream_sender, stream_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
+        let (stream_sender, stream_receiver) = make_packet_channel();
         IpStackUdpStream {
             src_addr,
             dst_addr,
@@ -102,7 +105,7 @@ impl IpStackUdpStream {
             mtu,
         }
     }
-    pub(crate) fn stream_sender(&self) -> UnboundedSender<NetworkPacket> {
+    pub(crate) fn stream_sender(&self) -> PacketSender {
         self.stream_sender.clone()
     }
     fn create_rev_packet(&self, ttl: u8, mut payload: Vec<u8>) -> Result<NetworkPacket, Error> {
@@ -180,15 +183,18 @@ impl AsyncRead for IpStackUdpStream {
         }
 
         let udp_timeout = self.udp_timeout;
-        match self.stream_receiver.poll_recv(cx) {
-            Poll::Ready(Some(p)) => {
+        match {
+            let mut fut = self.stream_receiver.recv_async();
+            fut.poll_unpin(cx)
+        }  {
+            Poll::Ready(Ok(p)) => {
                 buf.put_slice(&p.payload);
                 self.timeout
                     .as_mut()
                     .reset(tokio::time::Instant::now() + udp_timeout);
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(None) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(_)) => Poll::Ready(Ok(())),
             Poll::Pending => Poll::Pending,
         }
     }

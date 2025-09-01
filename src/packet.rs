@@ -1,6 +1,11 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use core::fmt;
+use std::{
+    fmt::Pointer,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+};
 
 use etherparse::{IpHeader, PacketHeaders, TcpHeader, TransportHeader};
+use tracing::info;
 
 use crate::error::IpStackError;
 
@@ -115,6 +120,17 @@ impl NetworkPacket {
             IpHeader::Version4(ip, _) => ip.time_to_live,
             IpHeader::Version6(ip, _) => ip.hop_limit,
         }
+    }
+}
+
+impl fmt::Display for NetworkTuple {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!(
+            "{}{} -> {}",
+            if self.tcp { "TCP " } else { "" },
+            &self.src,
+            &self.dst,
+        ))
     }
 }
 

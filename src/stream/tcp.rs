@@ -5,8 +5,17 @@ use crate::{
     DROP_TTL, TTL,
 };
 use etherparse::{Ipv4Extensions, Ipv4Header, Ipv6Extensions, TransportHeader};
+use flume::r#async::RecvFut;
+use futures::FutureExt;
 use std::{
-    cmp, fmt::Display, future::Future, io::{Error, ErrorKind}, net::SocketAddr, pin::Pin, task::Waker, time::Duration
+    cmp,
+    fmt::Display,
+    future::Future,
+    io::{Error, ErrorKind},
+    net::SocketAddr,
+    pin::Pin,
+    task::Waker,
+    time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -15,18 +24,20 @@ use tokio::{
         Notify,
     },
 };
-use tracing::{trace, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::packet::NetworkPacket;
 
 use super::tcb::PacketStatus;
 
+use crate::{make_packet_channel, PacketRecver, PacketSender};
+
 pub struct IpStackTcpStream {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
-    stream_sender: UnboundedSender<NetworkPacket>,
-    stream_receiver: UnboundedReceiver<NetworkPacket>,
-    packet_sender: UnboundedSender<NetworkPacket>,
+    stream_sender: PacketSender,
+    stream_receiver: PacketRecver,
+    packet_sender: PacketSender,
     packet_to_send: Option<NetworkPacket>,
     tcb: Tcb,
     mtu: u16,
@@ -36,7 +47,10 @@ pub struct IpStackTcpStream {
 
 impl Display for IpStackTcpStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{} -> {} <{:?}>", self.src_addr, self.dst_addr, self.tcb.tcp_timeout))
+        f.write_fmt(format_args!(
+            "{} -> {} <{:?}> {:?}",
+            self.src_addr, self.dst_addr, self.tcb.tcp_timeout, self.tcb.get_state()
+        ))
     }
 }
 
@@ -45,11 +59,11 @@ impl IpStackTcpStream {
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
         tcp: TcpPacket,
-        pkt_sender: UnboundedSender<NetworkPacket>,
+        pkt_sender: PacketSender,
         mtu: u16,
         tcp_timeout: Duration,
     ) -> Result<IpStackTcpStream, IpStackError> {
-        let (stream_sender, stream_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
+        let (stream_sender, stream_receiver) = make_packet_channel();
 
         let mut stream = IpStackTcpStream {
             src_addr,
@@ -76,7 +90,7 @@ impl IpStackTcpStream {
         }
         Ok(stream)
     }
-    pub(crate) fn stream_sender(&self) -> UnboundedSender<NetworkPacket> {
+    pub(crate) fn stream_sender(&self) -> PacketSender {
         self.stream_sender.clone()
     }
     fn calculate_payload_len(&self, ip_header_size: u16, tcp_header_size: u16) -> u16 {
@@ -188,11 +202,17 @@ impl AsyncRead for IpStackTcpStream {
             self.tcb.change_recv_window(min);
             // Timeout only applies to handshake.
             // Otherwise it kills long-running connections.
-            if matches!(self.tcb.get_state(), TcpState::SynReceived(_)) && matches!(
-                Pin::new(&mut self.tcb.timeout).poll(cx),
-                std::task::Poll::Ready(_)
-            ) {
-                trace!("timeout reached for {:?}. RST to {}", self.dst_addr, self.src_addr);
+            if matches!(self.tcb.get_state(), TcpState::SynReceived(_))
+                && matches!(
+                    Pin::new(&mut self.tcb.timeout).poll(cx),
+                    std::task::Poll::Ready(_)
+                )
+            {
+                trace!(
+                    "timeout reached for {:?}. RST to {}",
+                    self.dst_addr,
+                    self.src_addr
+                );
                 self.packet_sender
                     .send(self.create_rev_packet(
                         tcp_flags::RST | tcp_flags::ACK,
@@ -244,8 +264,11 @@ impl AsyncRead for IpStackTcpStream {
                 )?);
                 continue;
             }
-            match self.stream_receiver.poll_recv(cx) {
-                std::task::Poll::Ready(Some(p)) => {
+            let mut recv_task = Box::pin(self.stream_receiver.recv_async());
+            let resp = RecvFut::<'_, NetworkPacket>::poll(recv_task.as_mut(), cx);
+            drop(recv_task);
+            match resp {
+                std::task::Poll::Ready(Ok(p)) => {
                     let IpStackPacketProtocol::Tcp(t) = p.transport_protocol() else {
                         unreachable!()
                     };
@@ -408,7 +431,7 @@ impl AsyncRead for IpStackTcpStream {
                         }
                     }
                 }
-                std::task::Poll::Ready(None) => return std::task::Poll::Ready(Ok(())),
+                std::task::Poll::Ready(Err(err)) => return std::task::Poll::Ready(unimplemented!()),
                 std::task::Poll::Pending => return std::task::Poll::Pending,
             }
         }
@@ -425,6 +448,7 @@ impl AsyncWrite for IpStackTcpStream {
             || self.tcb.is_send_buffer_full()
         {
             self.write_notify = Some(cx.waker().clone());
+            info!("pending 1");
             return std::task::Poll::Pending;
         }
 
@@ -498,18 +522,20 @@ impl AsyncWrite for IpStackTcpStream {
 
 impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
-        tracing::error!("Drop {}. {:?}", &self, self.tcb.get_state());
+        tracing::warn!("drop {}", &self);
         if self.tcb.get_state() != &TcpState::Closed {
             self.packet_sender
-                    .send(self.create_rev_packet(
-                        tcp_flags::RST | tcp_flags::ACK,
-                        TTL,
-                        None,
-                        Vec::new(),
-                    ).unwrap()).unwrap();
+                .send(
+                    self.create_rev_packet(tcp_flags::RST | tcp_flags::ACK, TTL, None, Vec::new())
+                        .unwrap(),
+                )
+                .unwrap();
         }
         if let Ok(p) = self.create_rev_packet(0, DROP_TTL, None, Vec::new()) {
-            _ = self.packet_sender.send(p);
+            let rx = self.packet_sender.send(p);
+            if let Err(e) = rx {
+                error!("failed to drop conn {}", &self);
+            }
         }
     }
 }
