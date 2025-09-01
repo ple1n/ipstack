@@ -13,7 +13,7 @@ use tokio::{
     select,
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
-use tracing::{error, trace};
+use tracing::{error, info, trace};
 
 use crate::{
     packet::IpStackPacketProtocol,
@@ -87,20 +87,18 @@ impl IpStack {
         D: AsyncRead + AsyncWrite + std::marker::Unpin + std::marker::Send + 'static,
     {
         let (accept_sender, accept_receiver) = mpsc::unbounded_channel::<IpStackStream>();
-
+        
         tokio::spawn(async move {
             let mut streams: HashMap<NetworkTuple, UnboundedSender<NetworkPacket>> = HashMap::new();
             let mut buffer = [0u8; u16::MAX as usize];
-
+            
             let (pkt_sender, mut pkt_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
             loop {
-                // dbg!(streams.len());
                 select! {
                     Ok(n) = device.read(&mut buffer) => {
                         let offset = if config.packet_info && cfg!(not(target_os = "windows")) {4} else {0};
-                        // dbg!(&buffer[offset..n]);
                         let Ok(packet) = NetworkPacket::parse(&buffer[offset..n])else{
-                            trace!("parse error");
+                            info!("packet parse error");
                             continue;
                         };
                         match streams.entry(packet.network_tuple()){
@@ -164,8 +162,8 @@ impl IpStack {
                                 packet_byte.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP6].concat());
                             }
                         }
+                        
                         device.write_all(&packet_byte).await.unwrap();
-                        // device.flush().await.unwrap();
                     }
                 }
             }

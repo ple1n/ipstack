@@ -17,6 +17,7 @@ use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     time::Sleep,
 };
+use tracing::info;
 
 use crate::{packet::NetworkPacket, TTL};
 
@@ -174,6 +175,7 @@ impl AsyncRead for IpStackUdpStream {
             return Poll::Ready(Ok(()));
         }
         if matches!(self.timeout.as_mut().poll(cx), std::task::Poll::Ready(_)) {
+            info!("udp timeout");
             return Poll::Ready(Ok(())); // todo: return timeout error
         }
 
