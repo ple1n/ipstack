@@ -264,11 +264,8 @@ impl AsyncRead for IpStackTcpStream {
                 )?);
                 continue;
             }
-            let mut recv_task = Box::pin(self.stream_receiver.recv_async());
-            let resp = RecvFut::<'_, NetworkPacket>::poll(recv_task.as_mut(), cx);
-            drop(recv_task);
-            match resp {
-                std::task::Poll::Ready(Ok(p)) => {
+            match self.stream_receiver.poll_recv(cx) {
+                std::task::Poll::Ready(Some(p)) => {
                     let IpStackPacketProtocol::Tcp(t) = p.transport_protocol() else {
                         unreachable!()
                     };
@@ -431,7 +428,7 @@ impl AsyncRead for IpStackTcpStream {
                         }
                     }
                 }
-                std::task::Poll::Ready(Err(err)) => return std::task::Poll::Ready(unimplemented!()),
+                std::task::Poll::Ready(None) => return std::task::Poll::Ready(unimplemented!()),
                 std::task::Poll::Pending => return std::task::Poll::Pending,
             }
         }

@@ -19,7 +19,7 @@ use tokio::{
 };
 use tracing::info;
 
-use crate::{PacketRecver, PacketSender, TTL, make_packet_channel, packet::NetworkPacket};
+use crate::{make_packet_channel, packet::NetworkPacket, PacketRecver, PacketSender, TTL};
 
 pub struct IpStackUdpStream {
     src_addr: SocketAddr,
@@ -40,17 +40,14 @@ impl Stream for IpStackUdpStream {
             return Poll::Ready(None); // todo: return timeout error
         }
         let udp_timeout = self.udp_timeout;
-        match {
-            let mut fut = self.stream_receiver.recv_async();
-            fut.poll_unpin(cx)
-        } {
-            Poll::Ready(Ok(p)) => {
+        match { self.stream_receiver.poll_recv(cx) } {
+            Poll::Ready(Some(p)) => {
                 self.timeout
                     .as_mut()
                     .reset(tokio::time::Instant::now() + udp_timeout);
                 Poll::Ready(Some(p))
             }
-            Poll::Ready(Err(_)) => Poll::Ready(None),
+            Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -183,18 +180,15 @@ impl AsyncRead for IpStackUdpStream {
         }
 
         let udp_timeout = self.udp_timeout;
-        match {
-            let mut fut = self.stream_receiver.recv_async();
-            fut.poll_unpin(cx)
-        }  {
-            Poll::Ready(Ok(p)) => {
+        match { self.stream_receiver.poll_recv(cx) } {
+            Poll::Ready(Some(p)) => {
                 buf.put_slice(&p.payload);
                 self.timeout
                     .as_mut()
                     .reset(tokio::time::Instant::now() + udp_timeout);
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Err(_)) => Poll::Ready(Ok(())),
+            Poll::Ready(None) => Poll::Ready(Ok(())),
             Poll::Pending => Poll::Pending,
         }
     }

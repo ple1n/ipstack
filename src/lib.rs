@@ -36,13 +36,13 @@ pub mod stream;
 pub use flume;
 
 pub type TUNDev = Arc<AsyncDevice>;
-pub type Sender<T> = flume::Sender<T>;
-pub type Recver<T> = flume::Receiver<T>;
+pub type Sender<T> = mpsc::UnboundedSender<T>;
+pub type Recver<T> = mpsc::UnboundedReceiver<T>;
 pub type PacketSender = Sender<NetworkPacket>;
 pub type PacketRecver = Recver<NetworkPacket>;
 
 pub fn make_packet_channel() -> (PacketSender, PacketRecver) {
-    flume::unbounded()
+    mpsc::unbounded_channel()
 }
 
 const DROP_TTL: u8 = 0;
@@ -118,7 +118,7 @@ impl IpStack {
             let single_dev =
                 |dev: TUNDev,
                  streams: Arc<DashMap<NetworkTuple, PacketSender>>,
-                 pkt_recv: PacketRecver,
+                 mut pkt_recv: PacketRecver,
                  pkt_sx: PacketSender,
                  stream_sx: UnboundedSender<IpStackStream>| async {
                     let dev_sx = dev;
@@ -155,7 +155,7 @@ impl IpStack {
                                             mapref::entry::Entry::Occupied(entry) => {
                                                 trace!("known {}", &packet.network_tuple());
                                                 let sx = entry.get();
-                                                let sending = sx.send_async(packet).await;
+                                                let sending = sx.send(packet);
                                                 if let Err(e) = sending {
                                                     error!("sending packet to stack {:?}", e);
                                                     return Result::<(), IpStackError>::Ok(());
@@ -217,7 +217,9 @@ impl IpStack {
                     };
 
                     let send_to_dev = async move {
-                        while let Ok(packet) = pkt_recv.recv_async().await {
+                        trace!("send_to_dev");
+                        while let Some(packet) = pkt_recv.recv().await {
+                            trace!("send packet to dev");
                             if packet.ttl() == 0 {
                                 streams.remove(&packet.reverse_network_tuple());
                                 trace!("removed {:?}", &packet.reverse_network_tuple());
