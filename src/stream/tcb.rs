@@ -8,8 +8,8 @@ use tokio::time::Sleep;
 
 use crate::packet::TcpPacket;
 
-const MAX_UNACK: u32 = 1024 * 16; // 16KB
-const READ_BUFFER_SIZE: usize = u16::MAX as usize; // 16KB
+const MAX_UNACK: u32 = u16::MAX as u32; 
+const READ_BUFFER_SIZE: usize = u16::MAX as usize; 
 
 #[derive(Clone, Debug, PartialEq, Eq, Copy)]
 pub enum TcpState {
