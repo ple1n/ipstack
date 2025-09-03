@@ -49,12 +49,21 @@ impl Display for IpStackTcpStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!(
             "{} -> {} <{:?}> {:?}",
-            self.src_addr, self.dst_addr, self.tcb.tcp_timeout, self.tcb.get_state()
+            self.src_addr,
+            self.dst_addr,
+            self.tcb.tcp_timeout,
+            self.tcb.get_state()
         ))
     }
 }
 
 impl IpStackTcpStream {
+    pub fn rst(&mut self) -> std::io::Result<()> {
+        self.packet_sender
+            .send(self.create_rev_packet(tcp_flags::RST | tcp_flags::ACK, TTL, None, Vec::new())?)
+            .map_err(|_| ErrorKind::UnexpectedEof)?;
+        Ok(())
+    }
     pub(crate) async fn new(
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
@@ -213,14 +222,7 @@ impl AsyncRead for IpStackTcpStream {
                     self.dst_addr,
                     self.src_addr
                 );
-                self.packet_sender
-                    .send(self.create_rev_packet(
-                        tcp_flags::RST | tcp_flags::ACK,
-                        TTL,
-                        None,
-                        Vec::new(),
-                    )?)
-                    .map_err(|_| ErrorKind::UnexpectedEof)?;
+                self.rst()?;
                 return std::task::Poll::Ready(Err(Error::from(ErrorKind::TimedOut)));
             }
 
@@ -445,7 +447,6 @@ impl AsyncWrite for IpStackTcpStream {
             || self.tcb.is_send_buffer_full()
         {
             self.write_notify = Some(cx.waker().clone());
-            info!("pending 1");
             return std::task::Poll::Pending;
         }
 
@@ -521,12 +522,7 @@ impl Drop for IpStackTcpStream {
     fn drop(&mut self) {
         tracing::warn!("drop {}", &self);
         if self.tcb.get_state() != &TcpState::Closed {
-            self.packet_sender
-                .send(
-                    self.create_rev_packet(tcp_flags::RST | tcp_flags::ACK, TTL, None, Vec::new())
-                        .unwrap(),
-                )
-                .unwrap();
+            self.rst().unwrap();
         }
         if let Ok(p) = self.create_rev_packet(0, DROP_TTL, None, Vec::new()) {
             let rx = self.packet_sender.send(p);

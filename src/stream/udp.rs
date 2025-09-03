@@ -1,11 +1,6 @@
 use core::task;
 use std::{
-    future::Future,
-    io::{self, Error, ErrorKind},
-    net::SocketAddr,
-    pin::Pin,
-    task::{Context, Poll},
-    time::Duration,
+    fmt::Display, future::Future, io::{self, Error, ErrorKind}, net::SocketAddr, pin::Pin, task::{Context, Poll}, time::Duration
 };
 
 use etherparse::{
@@ -31,6 +26,12 @@ pub struct IpStackUdpStream {
     timeout: Pin<Box<Sleep>>,
     udp_timeout: Duration,
     mtu: u16,
+}
+
+impl Display for IpStackUdpStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{} -> {}", self.src_addr, self.dst_addr))
+    }
 }
 
 impl Stream for IpStackUdpStream {
