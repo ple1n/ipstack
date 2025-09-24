@@ -250,9 +250,14 @@ impl AsyncRead for IpStackTcpStream {
             }
             if let Some(b) = self.tcb.get_unordered_packets() {
                 if b.len() > buf.remaining() {
-                    let seq = self.tcb.ack;
-                    buf.put_slice(&b[..buf.remaining()]);
-                    self.tcb.add_unordered_packet(seq, &b[buf.remaining()..]);
+                    let read = &b[..buf.remaining()];
+                    self.tcb.add_ack(read.len() as u32);
+                    let ack = self.tcb.ack;
+                    buf.put_slice(read);
+                    self.tcb.add_unordered_packet(ack, &b[buf.remaining()..]);
+                    self.packet_sender
+                        .send(self.create_rev_packet(tcp_flags::ACK, TTL, None, Vec::new())?)
+                        .map_err(|_| Error::from(ErrorKind::UnexpectedEof))?;
                 } else {
                     self.tcb.add_ack(b.len() as u32);
                     buf.put_slice(&b);
