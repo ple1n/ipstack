@@ -249,11 +249,17 @@ impl AsyncRead for IpStackTcpStream {
                 }
             }
             if let Some(b) = self.tcb.get_unordered_packets() {
-                self.tcb.add_ack(b.len() as u32);
-                buf.put_slice(&b);
-                self.packet_sender
-                    .send(self.create_rev_packet(tcp_flags::ACK, TTL, None, Vec::new())?)
-                    .map_err(|_| Error::from(ErrorKind::UnexpectedEof))?;
+                if b.len() > buf.remaining() {
+                    let seq = self.tcb.ack;
+                    buf.put_slice(&b[..buf.remaining()]);
+                    self.tcb.add_unordered_packet(seq, &b[buf.remaining()..]);
+                } else {
+                    self.tcb.add_ack(b.len() as u32);
+                    buf.put_slice(&b);
+                    self.packet_sender
+                        .send(self.create_rev_packet(tcp_flags::ACK, TTL, None, Vec::new())?)
+                        .map_err(|_| Error::from(ErrorKind::UnexpectedEof))?;
+                }
                 return std::task::Poll::Ready(Ok(()));
             }
             if self.shutdown.is_some() && matches!(self.tcb.get_state(), TcpState::Established) {
