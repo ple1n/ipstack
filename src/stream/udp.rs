@@ -1,82 +1,27 @@
-use core::task;
-use std::{
-    fmt::Display, future::Future, io::{self, Error, ErrorKind}, net::SocketAddr, pin::Pin, task::{Context, Poll}, time::Duration
+use crate::{
+    IpStackError, PacketRecver, PacketSender, TTL,
+    packet::{IpHeader, NetworkPacket, TransportHeader},
 };
-
-use etherparse::{
-    Ipv4Extensions, Ipv4Header, Ipv6Extensions, Ipv6Header, TransportHeader, UdpHeader,
-};
-use futures::{FutureExt, Sink, Stream};
+use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, Ipv6Header, UdpHeader};
+use std::{future::Future, net::SocketAddr, pin::Pin, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    sync::mpsc,
     time::Sleep,
 };
-use tracing::{info, trace};
 
-use crate::{make_packet_channel, packet::NetworkPacket, PacketRecver, PacketSender, TTL};
-
+#[derive(Debug)]
 pub struct IpStackUdpStream {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
     stream_sender: PacketSender,
     stream_receiver: PacketRecver,
-    packet_sender: PacketSender,
-    first_paload: Option<Vec<u8>>,
+    up_pkt_sender: PacketSender,
+    first_payload: Option<Vec<u8>>,
     timeout: Pin<Box<Sleep>>,
-    udp_timeout: Duration,
+    timeout_interval: Duration,
     mtu: u16,
-}
-
-impl Display for IpStackUdpStream {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{} -> {}", self.src_addr, self.dst_addr))
-    }
-}
-
-impl Stream for IpStackUdpStream {
-    type Item = NetworkPacket;
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if matches!(self.timeout.as_mut().poll(cx), std::task::Poll::Ready(_)) {
-            return Poll::Ready(None); // todo: return timeout error
-        }
-        let udp_timeout = self.udp_timeout;
-        match { self.stream_receiver.poll_recv(cx) } {
-            Poll::Ready(Some(p)) => {
-                self.timeout
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + udp_timeout);
-                Poll::Ready(Some(p))
-            }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl Sink<&[u8]> for IpStackUdpStream {
-    type Error = io::Error;
-    fn start_send(mut self: Pin<&mut Self>, item: &[u8]) -> Result<(), Self::Error> {
-        let udp_timeout = self.udp_timeout;
-        self.timeout
-            .as_mut()
-            .reset(tokio::time::Instant::now() + udp_timeout);
-        let packet = self.create_rev_packet(TTL, item.to_vec())?;
-        self.packet_sender
-            .send(packet)
-            .map_err(|_| Error::from(ErrorKind::UnexpectedEof))?;
-
-        Ok(())
-    }
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
+    destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
 }
 
 impl IpStackUdpStream {
@@ -84,146 +29,139 @@ impl IpStackUdpStream {
         src_addr: SocketAddr,
         dst_addr: SocketAddr,
         payload: Vec<u8>,
-        pkt_sender: PacketSender,
+        up_pkt_sender: PacketSender,
         mtu: u16,
-        udp_timeout: Duration,
+        timeout_interval: Duration,
+        destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
     ) -> Self {
-        let (stream_sender, stream_receiver) = make_packet_channel();
+        let (stream_sender, stream_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
+        let deadline = tokio::time::Instant::now() + timeout_interval;
         IpStackUdpStream {
             src_addr,
             dst_addr,
             stream_sender,
             stream_receiver,
-            packet_sender: pkt_sender.clone(),
-            first_paload: Some(payload),
-            timeout: Box::pin(tokio::time::sleep_until(
-                tokio::time::Instant::now() + udp_timeout,
-            )),
-            udp_timeout,
+            up_pkt_sender,
+            first_payload: Some(payload),
+            timeout: Box::pin(tokio::time::sleep_until(deadline)),
+            timeout_interval,
             mtu,
+            destroy_messenger,
         }
     }
+
     pub(crate) fn stream_sender(&self) -> PacketSender {
         self.stream_sender.clone()
     }
-    fn create_rev_packet(&self, ttl: u8, mut payload: Vec<u8>) -> Result<NetworkPacket, Error> {
+
+    fn create_rev_packet(&self, ttl: u8, mut payload: Vec<u8>) -> std::io::Result<NetworkPacket> {
+        const UHS: usize = 8; // udp header size is 8
         match (self.dst_addr.ip(), self.src_addr.ip()) {
             (std::net::IpAddr::V4(dst), std::net::IpAddr::V4(src)) => {
-                let mut ip_h = Ipv4Header::new(0, ttl, 17, dst.octets(), src.octets());
-                let line_buffer = self.mtu.saturating_sub(ip_h.header_len() as u16 + 8); // 8 is udp header size
+                let mut ip_h = Ipv4Header::new(0, ttl, IpNumber::UDP, dst.octets(), src.octets()).map_err(IpStackError::from)?;
+                let line_buffer = self.mtu.saturating_sub((ip_h.header_len() + UHS) as u16);
                 payload.truncate(line_buffer as usize);
-                ip_h.payload_len = payload.len() as u16 + 8; // 8 is udp header size
-                let udp_header = UdpHeader::with_ipv4_checksum(
-                    self.dst_addr.port(),
-                    self.src_addr.port(),
-                    &ip_h,
-                    &payload,
-                )
-                .map_err(|_e| Error::from(ErrorKind::InvalidInput))?;
+                ip_h.set_payload_len(payload.len() + UHS).map_err(IpStackError::from)?;
+                let udp_header = UdpHeader::with_ipv4_checksum(self.dst_addr.port(), self.src_addr.port(), &ip_h, &payload)
+                    .map_err(IpStackError::from)?;
                 Ok(NetworkPacket {
-                    ip: etherparse::IpHeader::Version4(ip_h, Ipv4Extensions::default()),
+                    ip: IpHeader::Ipv4(ip_h),
                     transport: TransportHeader::Udp(udp_header),
-                    payload,
+                    payload: Some(payload),
                 })
             }
             (std::net::IpAddr::V6(dst), std::net::IpAddr::V6(src)) => {
                 let mut ip_h = Ipv6Header {
                     traffic_class: 0,
-                    flow_label: 0,
+                    flow_label: Ipv6FlowLabel::ZERO,
                     payload_length: 0,
-                    next_header: 17,
+                    next_header: IpNumber::UDP,
                     hop_limit: ttl,
                     source: dst.octets(),
                     destination: src.octets(),
                 };
-                let line_buffer = self.mtu.saturating_sub(ip_h.header_len() as u16 + 8); // 8 is udp header size
+                let line_buffer = self.mtu.saturating_sub((ip_h.header_len() + UHS) as u16);
 
                 payload.truncate(line_buffer as usize);
 
-                ip_h.payload_length = payload.len() as u16 + 8; // 8 is udp header size
-                let udp_header = UdpHeader::with_ipv6_checksum(
-                    self.dst_addr.port(),
-                    self.src_addr.port(),
-                    &ip_h,
-                    &payload,
-                )
-                .map_err(|_e| Error::from(ErrorKind::InvalidInput))?;
+                ip_h.payload_length = (payload.len() + UHS) as u16;
+                let udp_header = UdpHeader::with_ipv6_checksum(self.dst_addr.port(), self.src_addr.port(), &ip_h, &payload)
+                    .map_err(IpStackError::from)?;
                 Ok(NetworkPacket {
-                    ip: etherparse::IpHeader::Version6(ip_h, Ipv6Extensions::default()),
+                    ip: IpHeader::Ipv6(ip_h),
                     transport: TransportHeader::Udp(udp_header),
-                    payload,
+                    payload: Some(payload),
                 })
             }
             _ => unreachable!(),
         }
     }
+
     pub fn local_addr(&self) -> SocketAddr {
         self.src_addr
     }
+
     pub fn peer_addr(&self) -> SocketAddr {
         self.dst_addr
+    }
+
+    fn reset_timeout(&mut self) {
+        let deadline = tokio::time::Instant::now() + self.timeout_interval;
+        self.timeout.as_mut().reset(deadline);
     }
 }
 
 impl AsyncRead for IpStackUdpStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> task::Poll<io::Result<()>> {
-        if let Some(p) = self.first_paload.take() {
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Some(p) = self.first_payload.take() {
             buf.put_slice(&p);
-            return Poll::Ready(Ok(()));
+            return std::task::Poll::Ready(Ok(()));
         }
         if matches!(self.timeout.as_mut().poll(cx), std::task::Poll::Ready(_)) {
-            trace!("udp timeout");
-            return Poll::Ready(Ok(())); // todo: return timeout error
+            return std::task::Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
         }
 
-        let udp_timeout = self.udp_timeout;
-        match { self.stream_receiver.poll_recv(cx) } {
-            Poll::Ready(Some(p)) => {
-                buf.put_slice(&p.payload);
-                self.timeout
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + udp_timeout);
-                Poll::Ready(Ok(()))
+        self.reset_timeout();
+
+        match self.stream_receiver.poll_recv(cx) {
+            std::task::Poll::Ready(Some(p)) => {
+                if let Some(payload) = p.payload {
+                    buf.put_slice(&payload);
+                }
+                std::task::Poll::Ready(Ok(()))
             }
-            Poll::Ready(None) => Poll::Ready(Ok(())),
-            Poll::Pending => Poll::Pending,
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())),
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
 
 impl AsyncWrite for IpStackUdpStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        _cx: &mut task::Context<'_>,
-        buf: &[u8],
-    ) -> task::Poll<Result<usize, io::Error>> {
-        let udp_timeout = self.udp_timeout;
-        self.timeout
-            .as_mut()
-            .reset(tokio::time::Instant::now() + udp_timeout);
+    fn poll_write(mut self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        self.reset_timeout();
         let packet = self.create_rev_packet(TTL, buf.to_vec())?;
-        let payload_len = packet.payload.len();
-        self.packet_sender
-            .send(packet)
-            .map_err(|_| Error::from(ErrorKind::UnexpectedEof))?;
+        let payload_len = packet.payload.as_ref().map(|p| p.len()).unwrap_or(0);
+        self.up_pkt_sender.send(packet).or(Err(std::io::ErrorKind::UnexpectedEof))?;
         std::task::Poll::Ready(Ok(payload_len))
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut task::Context<'_>,
-    ) -> task::Poll<Result<(), io::Error>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        _cx: &mut task::Context<'_>,
-    ) -> task::Poll<Result<(), io::Error>> {
-        Poll::Ready(Ok(()))
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for IpStackUdpStream {
+    fn drop(&mut self) {
+        if let Some(messenger) = self.destroy_messenger.take() {
+            let _ = messenger.send(());
+        }
     }
 }

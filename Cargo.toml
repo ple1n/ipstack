@@ -3,21 +3,22 @@ authors = ['Narrowlink <opensource@narrowlink.com>']
 description = 'Asynchronous lightweight implementation of TCP/IP stack for Tun device'
 name = "ipstack"
 version = "0.0.2"
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 repository = 'https://github.com/narrowlink/ipstack'
 # homepage = 'https://github.com/narrowlink/ipstack'
 readme = "README.md"
 
 [dependencies]
-tokio = { version = "1.33", features = [
+tokio = { version = "1.47", features = [
     "sync",
     "rt",
     "time",
     "io-util",
     "macros",
+    "rt-multi-thread",
 ], default-features = false }
-etherparse = { version = "0.13", default-features = false }
+etherparse = { version = "0.19", default-features = false, features = ["std"] }
 thiserror = { version = "1.0", default-features = false }
 tracing = { version = "0.1.40", default-features = false }
 futures = "0.3.30"
@@ -28,6 +29,7 @@ rand = "0.9.2"
 
 [dev-dependencies]
 udp-stream = { version = "0.0.9", default-features = false }
+criterion = { version = "0.7" }                              # Benchmarksk
 
 [profile.release]
 opt-level = 3

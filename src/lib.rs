@@ -1,14 +1,14 @@
-use dashmap::{mapref, DashMap, OccupiedEntry};
+use dashmap::{DashMap, OccupiedEntry, mapref};
 pub use error::IpStackError;
 use futures::{
-    future::{join_all, Join, JoinAll},
     SinkExt,
+    future::{Join, JoinAll, join_all},
 };
 use packet::{NetworkPacket, NetworkTuple};
 use std::{
     collections::{
-        hash_map::Entry::{Occupied, Vacant},
         HashMap,
+        hash_map::Entry::{Occupied, Vacant},
     },
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -27,8 +27,8 @@ use tracing::{debug, error, info, trace, warn};
 use tun_rs::AsyncDevice;
 
 use crate::{
-    packet::IpStackPacketProtocol,
-    stream::{IpStackTcpStream, IpStackUdpStream},
+    packet::TransportHeader,
+    stream::{IpStackTcpStream, IpStackUdpStream, tcp::TcpConfig},
 };
 mod error;
 mod packet;
@@ -66,10 +66,11 @@ const TUN_PROTO_IP6: [u8; 2] = [0x00, 0x02];
 #[cfg(target_os = "macos")]
 const TUN_PROTO_IP4: [u8; 2] = [0x00, 0x02];
 
+#[derive(Clone)]
 pub struct IpStackConfig {
     pub mtu: u16,
-    pub packet_info: bool,
-    pub tcp_timeout: Duration,
+    pub packet_information: bool,
+    pub tcp_config: Arc<TcpConfig>,
     pub udp_timeout: Duration,
 }
 
@@ -77,25 +78,30 @@ impl Default for IpStackConfig {
     fn default() -> Self {
         IpStackConfig {
             mtu: u16::MAX,
-            packet_info: false,
-            tcp_timeout: Duration::from_secs(60),
+            packet_information: false,
+            tcp_config: Arc::new(TcpConfig::default()),
             udp_timeout: Duration::from_secs(30),
         }
     }
 }
 
 impl IpStackConfig {
-    pub fn tcp_timeout(&mut self, timeout: Duration) {
-        self.tcp_timeout = timeout;
+    /// Set custom TCP configuration
+    pub fn with_tcp_config(&mut self, config: TcpConfig) -> &mut Self {
+        self.tcp_config = Arc::new(config);
+        self
     }
-    pub fn udp_timeout(&mut self, timeout: Duration) {
+    pub fn udp_timeout(&mut self, timeout: Duration) -> &mut Self {
         self.udp_timeout = timeout;
+        self
     }
-    pub fn mtu(&mut self, mtu: u16) {
+    pub fn mtu(&mut self, mtu: u16) -> &mut Self {
         self.mtu = mtu;
+        self
     }
-    pub fn packet_info(&mut self, packet_info: bool) {
-        self.packet_info = packet_info;
+    pub fn packet_information(&mut self, packet_information: bool) -> &mut Self {
+        self.packet_information = packet_information;
+        self
     }
 }
 
@@ -106,11 +112,12 @@ pub struct IpStack {
 impl IpStack {
     pub fn new(config: IpStackConfig, mut device: TUNDev) -> IpStack {
         let (accept_sender, accept_receiver) = mpsc::unbounded_channel::<IpStackStream>();
-
+        let config2 = config.clone();
         tokio::spawn(async move {
             let streams: Arc<DashMap<NetworkTuple, PacketSender>> = DashMap::new().into();
 
             let (pkt_sender, pkt_receiver) = make_packet_channel();
+            let pkt_sender2 = pkt_sender.clone();            
             // This only applies to linux. see multi-queue
             const CONCURRENCY: usize = 1;
 
@@ -126,13 +133,18 @@ impl IpStack {
                     let streams1 = streams.clone();
                     let from_dev = async move {
                         let streams = streams1;
-                        let offset = if config.packet_info && cfg!(not(target_os = "windows")) {
-                            4
-                        } else {
-                            0
-                        };
+                        let offset =
+                            if config.packet_information && cfg!(not(target_os = "windows")) {
+                                4
+                            } else {
+                                0
+                            };
+                        let config = config.clone();
+
                         loop {
                             let mut buffer = [0u8; u16::MAX as usize];
+                            let config = config.clone();
+                            let pkt_sender = pkt_sender.clone();
                             match dev_rx.recv(&mut buffer).await {
                                 Ok(len) => {
                                     trace!(
@@ -162,19 +174,20 @@ impl IpStack {
                                                 }
                                             }
                                             mapref::entry::Entry::Vacant(entry) => {
+                                                let (tx, rx) =
+                                                    tokio::sync::oneshot::channel::<()>();
                                                 trace!("new {}", &packet.network_tuple());
-                                                match packet.transport_protocol() {
-                                                    IpStackPacketProtocol::Tcp(h) => {
+                                                match packet.transport_header() {
+                                                    TransportHeader::Tcp(h) => {
                                                         match IpStackTcpStream::new(
                                                             packet.src_addr(),
                                                             packet.dst_addr(),
-                                                            h,
-                                                            pkt_sx.clone(),
+                                                            h.clone(),
+                                                            pkt_sender,
                                                             config.mtu,
-                                                            config.tcp_timeout,
-                                                        )
-                                                        .await
-                                                        {
+                                                            Some(tx),
+                                                            config.tcp_config.clone(),
+                                                        ) {
                                                             Ok(stream) => {
                                                                 entry
                                                                     .insert(stream.stream_sender());
@@ -189,19 +202,23 @@ impl IpStack {
                                                             }
                                                         }
                                                     }
-                                                    IpStackPacketProtocol::Udp => {
+                                                    TransportHeader::Udp(_) => {
                                                         let stream = IpStackUdpStream::new(
                                                             packet.src_addr(),
                                                             packet.dst_addr(),
-                                                            packet.payload,
+                                                            packet.payload.unwrap_or_default(),
                                                             pkt_sx.clone(),
                                                             config.mtu,
                                                             config.udp_timeout,
+                                                            Some(tx),
                                                         );
                                                         entry.insert(stream.stream_sender());
                                                         stream_sx
                                                             .send(IpStackStream::Udp(stream))
                                                             .unwrap();
+                                                    }
+                                                    TransportHeader::Unknown => {
+                                                        return  Err(IpStackError::UnsupportedTransportProtocol);
                                                     }
                                                 }
                                             }
@@ -215,7 +232,7 @@ impl IpStack {
                             }
                         }
                     };
-
+                    let config = config2;
                     let send_to_dev = async move {
                         trace!("send_to_dev");
                         while let Some(packet) = pkt_recv.recv().await {
@@ -238,7 +255,7 @@ impl IpStack {
                                 continue;
                             };
                             #[cfg(not(target_os = "windows"))]
-                            if config.packet_info {
+                            if config.packet_information {
                                 if packet.src_addr().is_ipv4() {
                                     packet_byte.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP4].concat());
                                 } else {
@@ -256,7 +273,7 @@ impl IpStack {
 
                     futures::join!(send_to_dev, from_dev)
                 };
-
+            let pkt_sender=  pkt_sender2.clone();
             single_dev(device, streams, pkt_receiver, pkt_sender, accept_sender).await
 
             // let mut fut = vec![];
