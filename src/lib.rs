@@ -169,7 +169,7 @@ impl IpStack {
                                                 let sx = entry.get();
                                                 let sending = sx.send(packet);
                                                 if let Err(e) = sending {
-                                                    error!("sending packet to stack {:?}", e);
+                                                    warn!("sending packet to stack {:?}", e);
                                                     return Result::<(), IpStackError>::Ok(());
                                                 }
                                             }
