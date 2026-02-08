@@ -163,64 +163,75 @@ impl IpStack {
                                         };
                                         // info!("from dev {:?}", &packet.network_tuple());
 
-                                        match streams.entry(packet.network_tuple()) {
+                                        // Helper to create and register a new stream
+                                        let create_stream = |packet: NetworkPacket| -> Result<(), IpStackError> {
+                                            let tuple = packet.network_tuple();
+                                            let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
+                                            trace!("new {}", &tuple);
+                                            
+                                            match packet.transport_header() {
+                                                TransportHeader::Tcp(h) => {
+                                                    match IpStackTcpStream::new(
+                                                        packet.src_addr(),
+                                                        packet.dst_addr(),
+                                                        h.clone(),
+                                                        pkt_sender.clone(),
+                                                        config.mtu,
+                                                        Some(tx),
+                                                        config.tcp_config.clone(),
+                                                    ) {
+                                                        Ok(stream) => {
+                                                            streams.insert(tuple, stream.stream_sender());
+                                                            stream_sx
+                                                                .send(IpStackStream::Tcp(stream))
+                                                                .unwrap();
+                                                        }
+                                                        Err(e) => {
+                                                            error!("{}", e);
+                                                        }
+                                                    }
+                                                }
+                                                TransportHeader::Udp(_) => {
+                                                    let stream = IpStackUdpStream::new(
+                                                        packet.src_addr(),
+                                                        packet.dst_addr(),
+                                                        packet.payload.unwrap_or_default(),
+                                                        pkt_sx.clone(),
+                                                        config.mtu,
+                                                        config.udp_timeout,
+                                                        Some(tx),
+                                                    );
+                                                    streams.insert(tuple, stream.stream_sender());
+                                                    stream_sx
+                                                        .send(IpStackStream::Udp(stream))
+                                                        .unwrap();
+                                                }
+                                                TransportHeader::Unknown => {
+                                                    return Err(IpStackError::UnsupportedTransportProtocol);
+                                                }
+                                            }
+                                            Ok(())
+                                        };
+
+                                        let tuple = packet.network_tuple();
+                                        match streams.entry(tuple) {
                                             mapref::entry::Entry::Occupied(entry) => {
-                                                trace!("known {}", &packet.network_tuple());
+                                                trace!("known {}", &tuple);
                                                 let sx = entry.get();
-                                                let sending = sx.send(packet);
-                                                if let Err(e) = sending {
-                                                    warn!("sending packet to stack {:?}", e);
-                                                    return Result::<(), IpStackError>::Ok(());
+                                                match sx.send(packet) {
+                                                    Ok(_) => {}
+                                                    Err(send_err) => {
+                                                        let packet = send_err.0;
+                                                        warn!("stream dead, recreating {:?}", &tuple);
+                                                        drop(entry);
+                                                        streams.remove(&tuple);
+                                                        create_stream(packet)?;
+                                                    }
                                                 }
                                             }
                                             mapref::entry::Entry::Vacant(entry) => {
-                                                let (tx, rx) =
-                                                    tokio::sync::oneshot::channel::<()>();
-                                                trace!("new {}", &packet.network_tuple());
-                                                match packet.transport_header() {
-                                                    TransportHeader::Tcp(h) => {
-                                                        match IpStackTcpStream::new(
-                                                            packet.src_addr(),
-                                                            packet.dst_addr(),
-                                                            h.clone(),
-                                                            pkt_sender,
-                                                            config.mtu,
-                                                            Some(tx),
-                                                            config.tcp_config.clone(),
-                                                        ) {
-                                                            Ok(stream) => {
-                                                                entry
-                                                                    .insert(stream.stream_sender());
-                                                                stream_sx
-                                                                    .send(IpStackStream::Tcp(
-                                                                        stream,
-                                                                    ))
-                                                                    .unwrap();
-                                                            }
-                                                            Err(e) => {
-                                                                error!("{}", e);
-                                                            }
-                                                        }
-                                                    }
-                                                    TransportHeader::Udp(_) => {
-                                                        let stream = IpStackUdpStream::new(
-                                                            packet.src_addr(),
-                                                            packet.dst_addr(),
-                                                            packet.payload.unwrap_or_default(),
-                                                            pkt_sx.clone(),
-                                                            config.mtu,
-                                                            config.udp_timeout,
-                                                            Some(tx),
-                                                        );
-                                                        entry.insert(stream.stream_sender());
-                                                        stream_sx
-                                                            .send(IpStackStream::Udp(stream))
-                                                            .unwrap();
-                                                    }
-                                                    TransportHeader::Unknown => {
-                                                        return  Err(IpStackError::UnsupportedTransportProtocol);
-                                                    }
-                                                }
+                                                drop(entry);
+                                                create_stream(packet)?;
                                             }
                                         }
                                         Result::<(), IpStackError>::Ok(())

@@ -234,6 +234,7 @@ impl AsyncRead for IpStackTcpStream {
                 warn!("{network_tuple} {state:?}: [poll_read] {l_info}, session timeout reached, closing forcefully...");
                 let sender = &self.up_packet_sender;
                 write_packet_to_device(sender, network_tuple, &tcb, None, ACK | RST, None, None)?;
+                tcb.clear_buffers();
                 tcb.change_state(TcpState::Closed);
                 let state = tcb.get_state();
                 warn!("{network_tuple} {state:?}: [poll_read] {l_info}, session notified to close");
