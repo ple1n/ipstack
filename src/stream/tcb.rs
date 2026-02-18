@@ -300,12 +300,6 @@ impl Tcb {
         self.inflight_packets.values().collect::<Vec<_>>()
     }
 
-    /// Clear all inflight and unordered packets (called on connection timeout/close)
-    pub(crate) fn clear_buffers(&mut self) {
-        self.inflight_packets.clear();
-        self.unordered_packets.clear();
-    }
-
     pub fn is_send_buffer_full(&self) -> bool {
         // To respect the receiver's window (remote_window) size and avoid sending too many unacknowledged packets, which may cause packet loss
         // Simplified version: min(cwnd, rwnd)
