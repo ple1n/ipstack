@@ -213,6 +213,18 @@ impl IpStack {
                                             Ok(())
                                         };
 
+                                        // For TCP, only attempt to create a new stream for SYN packets.
+                                        // Non-SYN packets arriving for an unknown or dead stream are
+                                        // late/retransmitted segments — silently discard them.
+                                        let is_tcp_syn = matches!(
+                                            packet.transport_header(),
+                                            TransportHeader::Tcp(h) if h.syn
+                                        );
+                                        let is_tcp = matches!(
+                                            packet.transport_header(),
+                                            TransportHeader::Tcp(_)
+                                        );
+
                                         let tuple = packet.network_tuple();
                                         match streams.entry(tuple) {
                                             mapref::entry::Entry::Occupied(entry) => {
@@ -221,17 +233,27 @@ impl IpStack {
                                                 match sx.send(packet) {
                                                     Ok(_) => {}
                                                     Err(send_err) => {
-                                                        let packet = send_err.0;
-                                                        warn!("stream dead, recreating {:?}", &tuple);
                                                         drop(entry);
                                                         streams.remove(&tuple);
-                                                        create_stream(packet)?;
+                                                        let packet = send_err.0;
+                                                        if is_tcp && !is_tcp_syn {
+                                                            // Stream is gone; late non-SYN packet, discard quietly.
+                                                            trace!("stream dead, discarding non-SYN packet for {:?}", &tuple);
+                                                        } else {
+                                                            warn!("stream dead, recreating {:?}", &tuple);
+                                                            create_stream(packet)?;
+                                                        }
                                                     }
                                                 }
                                             }
                                             mapref::entry::Entry::Vacant(entry) => {
                                                 drop(entry);
-                                                create_stream(packet)?;
+                                                if is_tcp && !is_tcp_syn {
+                                                    // No existing stream and not a SYN — late/stray packet, discard.
+                                                    trace!("no stream, discarding non-SYN TCP packet for {:?}", &tuple);
+                                                } else {
+                                                    create_stream(packet)?;
+                                                }
                                             }
                                         }
                                         Result::<(), IpStackError>::Ok(())
