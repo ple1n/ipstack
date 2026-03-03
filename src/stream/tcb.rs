@@ -3,8 +3,8 @@ use etherparse::TcpHeader;
 use std::collections::BTreeMap;
 use tracing::*;
 
-const MAX_UNACK: u32 = 1024 * 16; // 16KB
-const READ_BUFFER_SIZE: usize = 1024 * 64; // 64KB
+const MAX_UNACK: u32 = 1024 * 512; // 512KB
+const READ_BUFFER_SIZE: usize = 1024 * 1024; // 1MB
 const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicate ACKs before retransmission
 
 /// Retransmission timeout
@@ -50,31 +50,50 @@ pub(crate) struct Tcb {
     ack: SeqNum,
     mtu: u16,
     last_received_ack: SeqNum,
-    send_window: u16,
+    send_window: u32,
     state: TcpState,
     inflight_packets: BTreeMap<SeqNum, InflightPacket>,
     unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
     duplicate_ack_count: usize,
     duplicate_ack_count_helper: SeqNum,
+    /// Window scale shift count for the send direction (remote's scale, applied to incoming window_size)
+    send_window_shift: u8,
+    /// Window scale shift count for the receive direction (our scale, applied to outgoing window_size)
+    recv_window_shift: u8,
 }
 
 impl Tcb {
-    pub(super) fn new(ack: SeqNum, mtu: u16) -> Tcb {
+    pub(super) fn new(ack: SeqNum, mtu: u16, remote_window_shift: u8) -> Tcb {
         #[cfg(debug_assertions)]
         let seq = 100;
         #[cfg(not(debug_assertions))]
         let seq = rand::Rng::random::<u32>(&mut rand::rng());
+
+        // Choose our receive window scale so that READ_BUFFER_SIZE fits in a u16 window field.
+        // shift = ceil(log2(READ_BUFFER_SIZE / 65535))
+        let recv_window_shift = if READ_BUFFER_SIZE <= u16::MAX as usize {
+            0u8
+        } else {
+            let mut shift = 0u8;
+            while (READ_BUFFER_SIZE >> shift) > u16::MAX as usize {
+                shift += 1;
+            }
+            shift.min(14) // TCP max window scale is 14
+        };
+
         Tcb {
             seq: seq.into(),
             ack,
             mtu,
             last_received_ack: seq.into(),
-            send_window: u16::MAX,
+            send_window: u16::MAX as u32,
             state: TcpState::Listen,
             inflight_packets: BTreeMap::new(),
             unordered_packets: BTreeMap::new(),
             duplicate_ack_count: 0,
             duplicate_ack_count_helper: seq.into(),
+            send_window_shift: remote_window_shift,
+            recv_window_shift,
         }
     }
 
@@ -181,13 +200,24 @@ impl Tcb {
         self.state
     }
     pub(super) fn update_send_window(&mut self, window: u16) {
-        self.send_window = window;
+        self.send_window = (window as u32) << self.send_window_shift;
     }
-    pub(super) fn get_send_window(&self) -> u16 {
+    pub(super) fn get_send_window(&self) -> u32 {
         self.send_window
     }
-    pub(super) fn get_recv_window(&self) -> u16 {
-        self.get_available_read_buffer_size().try_into().unwrap_or(u16::MAX)
+    /// Return the receive window as the actual byte count (u32).
+    pub(super) fn get_recv_window(&self) -> u32 {
+        self.get_available_read_buffer_size() as u32
+    }
+    /// Return the receive window scaled down to a u16 for the TCP header field.
+    pub(super) fn get_recv_window_for_wire(&self) -> u16 {
+        let available = self.get_available_read_buffer_size() as u32;
+        let scaled = available >> self.recv_window_shift;
+        scaled.min(u16::MAX as u32) as u16
+    }
+    /// Get our receive window shift count (for SYN-ACK options).
+    pub(super) fn get_recv_window_shift(&self) -> u8 {
+        self.recv_window_shift
     }
     // #[inline(always)]
     // pub(super) fn buffer_size(&self, payload_len: u16) -> u16 {
@@ -205,7 +235,7 @@ impl Tcb {
     pub(super) fn check_pkt_type(&self, tcp_header: &TcpHeader, payload: &[u8]) -> PacketType {
         let rcvd_ack = SeqNum(tcp_header.acknowledgment_number);
         let rcvd_seq = SeqNum(tcp_header.sequence_number);
-        let rcvd_window = tcp_header.window_size;
+        let rcvd_window_scaled = (tcp_header.window_size as u32) << self.send_window_shift;
         let len = payload.len();
         let res = if rcvd_ack > self.seq {
             PacketType::Invalid
@@ -217,7 +247,7 @@ impl Tcb {
                         PacketType::KeepAlive
                     } else if !payload.is_empty() {
                         PacketType::NewPacket
-                    } else if self.get_send_window() == rcvd_window && self.seq != rcvd_ack && self.is_duplicate_ack_count_exceeded() {
+                    } else if self.get_send_window() == rcvd_window_scaled && self.seq != rcvd_ack && self.is_duplicate_ack_count_exceeded() {
                         PacketType::RetransmissionRequest
                     } else {
                         PacketType::WindowUpdate
@@ -233,7 +263,7 @@ impl Tcb {
             }
         };
         #[rustfmt::skip]
-        trace!("received {{ ack = {:08X?}, seq = {:08X?}, window = {rcvd_window} }}, self {{ ack = {:08X?}, seq = {:08X?}, send_window = {} }}, len = {len}, {res:?}", rcvd_ack.0, rcvd_seq.0, self.ack.0, self.seq.0, self.get_send_window());
+        trace!("received {{ ack = {:08X?}, seq = {:08X?}, window = {rcvd_window_scaled} }}, self {{ ack = {:08X?}, seq = {:08X?}, send_window = {} }}, len = {len}, {res:?}", rcvd_ack.0, rcvd_seq.0, self.ack.0, self.seq.0, self.get_send_window());
         res
     }
 
@@ -310,7 +340,7 @@ impl Tcb {
     pub fn is_send_buffer_full(&self) -> bool {
         // To respect the receiver's window (remote_window) size and avoid sending too many unacknowledged packets, which may cause packet loss
         // Simplified version: min(cwnd, rwnd)
-        self.seq.distance(self.get_last_received_ack()) >= MAX_UNACK.min(self.get_send_window() as u32)
+        self.seq.distance(self.get_last_received_ack()) >= MAX_UNACK.min(self.get_send_window())
     }
 }
 
@@ -360,7 +390,7 @@ mod tests {
 
     #[test]
     fn test_get_unordered_packets_with_max_bytes() {
-        let mut tcb = Tcb::new(SeqNum(1000), 1500);
+        let mut tcb = Tcb::new(SeqNum(1000), 1500, 0);
 
         // insert 3 consecutive packets
         tcb.add_unordered_packet(SeqNum(1000), vec![1; 500]); // seq=1000, len=500
@@ -392,7 +422,7 @@ mod tests {
 
     #[test]
     fn test_update_inflight_packet_queue() {
-        let mut tcb = Tcb::new(SeqNum(1000), 1500);
+        let mut tcb = Tcb::new(SeqNum(1000), 1500, 0);
         tcb.seq = SeqNum(100); // setting the initial seq
 
         // insert 3 consecutive packets
@@ -416,7 +446,7 @@ mod tests {
 
     #[test]
     fn test_update_inflight_packet_queue_cumulative_ack() {
-        let mut tcb = Tcb::new(SeqNum(1000), 1500);
+        let mut tcb = Tcb::new(SeqNum(1000), 1500, 0);
         tcb.seq = SeqNum(1000);
 
         // Insert 3 consecutive packets
@@ -431,7 +461,7 @@ mod tests {
 
     #[test]
     fn test_retransmit_with_exponential_backoff() {
-        let mut tcb = Tcb::new(SeqNum(1000), 1500);
+        let mut tcb = Tcb::new(SeqNum(1000), 1500, 0);
 
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
 

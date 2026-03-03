@@ -53,6 +53,8 @@ pub struct TcpConfig {
 pub enum TcpOptions {
     /// Maximum segment size (MSS) for TCP connections.
     MaximumSegmentSize(u16),
+    /// TCP Window Scale option (shift count 0-14).
+    WindowScale(u8),
 }
 
 impl Default for TcpConfig {
@@ -141,7 +143,16 @@ impl IpStackTcpStream {
         destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
         config: Arc<TcpConfig>,
     ) -> Result<IpStackTcpStream, IpStackError> {
-        let tcb = Tcb::new(SeqNum(tcp.sequence_number), mtu);
+        // Parse the remote's window scale from the SYN options
+        let remote_window_shift = tcp
+            .options_iterator()
+            .filter_map(|o| o.ok())
+            .find_map(|o| match o {
+                TcpOptionElement::WindowScale(shift) => Some(shift.min(14)),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let tcb = Tcb::new(SeqNum(tcp.sequence_number), mtu, remote_window_shift);
         let tuple = NetworkTuple::new(src_addr, dst_addr, true);
         if !tcp.syn {
             if !tcp.rst
@@ -446,11 +457,14 @@ async fn tcp_main_logic_loop(
         let (seq, ack) = (tcb.get_seq().0, tcb.get_ack().0);
         let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
         trace!("{network_tuple} {state:?}: {l_info} session begins");
+        // Build SYN-ACK options: include user config options + our window scale
+        let mut synack_options: Vec<TcpOptions> = config.options.clone().unwrap_or_default();
+        synack_options.push(TcpOptions::WindowScale(tcb.get_recv_window_shift()));
         write_packet_to_device(
             &up_packet_sender,
             network_tuple,
             &tcb,
-            config.options.as_ref(),
+            Some(&synack_options),
             ACK | SYN,
             None,
             None,
@@ -869,7 +883,7 @@ pub(crate) fn write_packet_to_device(
 ) -> std::io::Result<usize> {
     use std::io::Error;
     let seq = seq.unwrap_or(tcb.get_seq()).0;
-    let (ack, window_size) = (tcb.get_ack().0, tcb.get_recv_window().max(tcb.get_mtu()));
+    let (ack, window_size) = (tcb.get_ack().0, tcb.get_recv_window_for_wire());
     let (src, dst) = (tuple.dst, tuple.src); // Note: The address is reversed here
     let calc = |ip_header_len: usize, tcp_header_len: usize| tcb.calculate_payload_max_len(ip_header_len, tcp_header_len);
     let packet = create_raw_packet(
@@ -915,6 +929,7 @@ pub(crate) fn create_raw_packet(
         for opt in opts {
             match opt {
                 TcpOptions::MaximumSegmentSize(mss) => tcp_options.push(TcpOptionElement::MaximumSegmentSize(*mss)),
+                TcpOptions::WindowScale(shift) => tcp_options.push(TcpOptionElement::WindowScale(*shift)),
             }
         }
         tcp_header
