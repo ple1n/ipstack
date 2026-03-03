@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use tracing::*;
 
 const MAX_UNACK: u32 = 1024 * 16; // 16KB
-const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
+const READ_BUFFER_SIZE: usize = 1024 * 64; // 64KB
 const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicate ACKs before retransmission
 
 /// Retransmission timeout

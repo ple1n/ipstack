@@ -710,9 +710,10 @@ async fn tcp_main_logic_loop(
                         ));
                     }
                 } else if flags == (ACK | PSH) && pkt_type == PacketType::NewPacket {
-                    if !payload.is_empty() && tcb.get_ack() == incoming_seq {
+                    if !payload.is_empty() {
                         tcb.add_unordered_packet(incoming_seq, payload);
                         extract_data_n_write_upstream(&up_packet_sender, &mut tcb, network_tuple, &data_tx, &read_notify)?;
+                        write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                     }
                 } else {
                     // unnormal case, we do nothing here
@@ -849,8 +850,9 @@ fn extract_data_n_write_upstream(
         trace!("{network_tuple} {state:?}: {l_info} {hint} receiving data, len = {}", data.len());
         data_tx.send(data).map_err(|e| std::io::Error::new(BrokenPipe, e))?;
         read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-        write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
     }
+    // Always send ACK: acknowledges new data and re-ACKs retransmissions so the remote stops retransmitting
+    write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
     Ok(())
 }
 
