@@ -100,8 +100,15 @@ impl Tcb {
 
     pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
         if seq < self.ack {
-            #[rustfmt::skip]
-            warn!("{:?}: Received packet seq {seq} < self ack {}, len = {}", self.state, self.ack, buf.len());
+            let overlap = self.ack.distance(seq) as usize;
+            if overlap >= buf.len() {
+                // Entire packet already acknowledged, nothing new
+                trace!("{:?}: Received fully acked retransmit seq {seq}, self ack {}, len = {}", self.state, self.ack, buf.len());
+                return;
+            }
+            // Trim the already-acknowledged prefix and insert only new data
+            trace!("{:?}: Trimming overlapping retransmit seq {seq} -> {}, overlap = {overlap}, len = {}", self.state, self.ack, buf.len());
+            self.unordered_packets.insert(self.ack, buf[overlap..].to_vec());
             return;
         }
         self.unordered_packets.insert(seq, buf);

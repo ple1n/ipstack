@@ -143,8 +143,6 @@ impl IpStack {
 
                         loop {
                             let mut buffer = [0u8; u16::MAX as usize];
-                            let config = config.clone();
-                            let pkt_sender = pkt_sender.clone();
                             match dev_rx.recv(&mut buffer).await {
                                 Ok(len) => {
                                     trace!(
@@ -152,112 +150,99 @@ impl IpStack {
                                         len,
                                         UNIX_EPOCH.elapsed().map(|k| k.as_millis())
                                     );
-                                    let streams = streams.clone();
-                                    let pkt_sx = pkt_sx.clone();
-                                    let stream_sx = stream_sx.clone();
-                                    tokio::spawn(async move {
-                                        let parse = NetworkPacket::parse(&buffer[offset..len]);
-                                        let Ok(packet) = parse else {
-                                            debug!("packet parse error {:?}", parse.err());
-                                            return Ok(());
-                                        };
-                                        // info!("from dev {:?}", &packet.network_tuple());
+                                    let parse = NetworkPacket::parse(&buffer[offset..len]);
+                                    let Ok(packet) = parse else {
+                                        debug!("packet parse error {:?}", parse.err());
+                                        continue;
+                                    };
 
-                                        // Helper to create and register a new stream
-                                        let create_stream = |packet: NetworkPacket| -> Result<(), IpStackError> {
-                                            let tuple = packet.network_tuple();
-                                            let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
-                                            trace!("new {}", &tuple);
-                                            
-                                            match packet.transport_header() {
-                                                TransportHeader::Tcp(h) => {
-                                                    match IpStackTcpStream::new(
-                                                        packet.src_addr(),
-                                                        packet.dst_addr(),
-                                                        h.clone(),
-                                                        pkt_sender.clone(),
-                                                        config.mtu,
-                                                        Some(tx),
-                                                        config.tcp_config.clone(),
-                                                    ) {
-                                                        Ok(stream) => {
-                                                            streams.insert(tuple, stream.stream_sender());
-                                                            stream_sx
-                                                                .send(IpStackStream::Tcp(stream))
-                                                                .unwrap();
-                                                        }
-                                                        Err(e) => {
-                                                            error!("{}", e);
-                                                        }
+                                    let is_tcp_syn = matches!(
+                                        packet.transport_header(),
+                                        TransportHeader::Tcp(h) if h.syn
+                                    );
+                                    let is_tcp = matches!(
+                                        packet.transport_header(),
+                                        TransportHeader::Tcp(_)
+                                    );
+                                    let tuple = packet.network_tuple();
+
+                                    // Try dispatching to existing stream.
+                                    // Release the DashMap read-lock before any write operation.
+                                    let packet = match streams.get(&tuple) {
+                                        Some(sender_ref) => {
+                                            match sender_ref.send(packet) {
+                                                Ok(_) => {
+                                                    trace!("known {}", &tuple);
+                                                    continue;
+                                                }
+                                                Err(send_err) => {
+                                                    drop(sender_ref);
+                                                    streams.remove(&tuple);
+                                                    let packet = send_err.0;
+                                                    if is_tcp && !is_tcp_syn {
+                                                        trace!("stream dead, discarding non-SYN packet for {:?}", &tuple);
+                                                        continue;
                                                     }
-                                                }
-                                                TransportHeader::Udp(_) => {
-                                                    let stream = IpStackUdpStream::new(
-                                                        packet.src_addr(),
-                                                        packet.dst_addr(),
-                                                        packet.payload.unwrap_or_default(),
-                                                        pkt_sx.clone(),
-                                                        config.mtu,
-                                                        config.udp_timeout,
-                                                        Some(tx),
-                                                    );
-                                                    streams.insert(tuple, stream.stream_sender());
-                                                    stream_sx
-                                                        .send(IpStackStream::Udp(stream))
-                                                        .unwrap();
-                                                }
-                                                TransportHeader::Unknown => {
-                                                    return Err(IpStackError::UnsupportedTransportProtocol);
-                                                }
-                                            }
-                                            Ok(())
-                                        };
-
-                                        // For TCP, only attempt to create a new stream for SYN packets.
-                                        // Non-SYN packets arriving for an unknown or dead stream are
-                                        // late/retransmitted segments — silently discard them.
-                                        let is_tcp_syn = matches!(
-                                            packet.transport_header(),
-                                            TransportHeader::Tcp(h) if h.syn
-                                        );
-                                        let is_tcp = matches!(
-                                            packet.transport_header(),
-                                            TransportHeader::Tcp(_)
-                                        );
-
-                                        let tuple = packet.network_tuple();
-                                        match streams.entry(tuple) {
-                                            mapref::entry::Entry::Occupied(entry) => {
-                                                trace!("known {}", &tuple);
-                                                let sx = entry.get();
-                                                match sx.send(packet) {
-                                                    Ok(_) => {}
-                                                    Err(send_err) => {
-                                                        drop(entry);
-                                                        streams.remove(&tuple);
-                                                        let packet = send_err.0;
-                                                        if is_tcp && !is_tcp_syn {
-                                                            // Stream is gone; late non-SYN packet, discard quietly.
-                                                            trace!("stream dead, discarding non-SYN packet for {:?}", &tuple);
-                                                        } else {
-                                                            warn!("stream dead, recreating {:?}", &tuple);
-                                                            create_stream(packet)?;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            mapref::entry::Entry::Vacant(entry) => {
-                                                drop(entry);
-                                                if is_tcp && !is_tcp_syn {
-                                                    // No existing stream and not a SYN — late/stray packet, discard.
-                                                    trace!("no stream, discarding non-SYN TCP packet for {:?}", &tuple);
-                                                } else {
-                                                    create_stream(packet)?;
+                                                    warn!("stream dead, recreating {:?}", &tuple);
+                                                    packet
                                                 }
                                             }
                                         }
-                                        Result::<(), IpStackError>::Ok(())
-                                    });
+                                        None => {
+                                            if is_tcp && !is_tcp_syn {
+                                                trace!("no stream, discarding non-SYN TCP packet for {:?}", &tuple);
+                                                continue;
+                                            }
+                                            packet
+                                        }
+                                    };
+
+                                    // Create and register a new stream
+                                    let tuple = packet.network_tuple();
+                                    let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
+                                    trace!("new {}", &tuple);
+                                    
+                                    match packet.transport_header() {
+                                        TransportHeader::Tcp(h) => {
+                                            match IpStackTcpStream::new(
+                                                packet.src_addr(),
+                                                packet.dst_addr(),
+                                                h.clone(),
+                                                pkt_sender.clone(),
+                                                config.mtu,
+                                                Some(tx),
+                                                config.tcp_config.clone(),
+                                            ) {
+                                                Ok(stream) => {
+                                                    streams.insert(tuple, stream.stream_sender());
+                                                    stream_sx
+                                                        .send(IpStackStream::Tcp(stream))
+                                                        .unwrap();
+                                                }
+                                                Err(e) => {
+                                                    error!("{}", e);
+                                                }
+                                            }
+                                        }
+                                        TransportHeader::Udp(_) => {
+                                            let stream = IpStackUdpStream::new(
+                                                packet.src_addr(),
+                                                packet.dst_addr(),
+                                                packet.payload.unwrap_or_default(),
+                                                pkt_sx.clone(),
+                                                config.mtu,
+                                                config.udp_timeout,
+                                                Some(tx),
+                                            );
+                                            streams.insert(tuple, stream.stream_sender());
+                                            stream_sx
+                                                .send(IpStackStream::Udp(stream))
+                                                .unwrap();
+                                        }
+                                        TransportHeader::Unknown => {
+                                            error!("unsupported transport protocol");
+                                        }
+                                    }
                                 }
                                 Err(ex) => {
                                     warn!("tun read {:?}", ex);
@@ -295,11 +280,8 @@ impl IpStack {
                                     packet_byte.splice(0..0, [TUN_FLAGS, TUN_PROTO_IP6].concat());
                                 }
                             }
-                            let dev_sx = dev_sx.clone();
-                            tokio::spawn(async move {
-                                trace!("write {} to dev", packet_byte.len());
-                                dev_sx.send(&packet_byte).await.unwrap();
-                            });
+                            trace!("write {} to dev", packet_byte.len());
+                            dev_sx.send(&packet_byte).await.unwrap();
                         }
                         error!("device writer stopped");
                     };
