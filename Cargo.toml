@@ -5,8 +5,7 @@ name = "nsproxy-ipstack"
 version = "0.0.2"
 edition = "2024"
 license = "Apache-2.0"
-repository = 'https://github.com/narrowlink/ipstack'
-# homepage = 'https://github.com/narrowlink/ipstack'
+repository = 'https://github.com/ple1n/ipstack/'
 readme = "README.md"
 
 [dependencies]
