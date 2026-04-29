@@ -240,7 +240,7 @@ impl IpStack {
                                                 .unwrap();
                                         }
                                         TransportHeader::Unknown => {
-                                            error!("unsupported transport protocol");
+                                            info!("unsupported transport protocol");
                                         }
                                     }
                                 }
