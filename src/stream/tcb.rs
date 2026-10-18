@@ -97,10 +97,17 @@ impl Tcb {
         }
     }
 
-    pub fn calculate_payload_max_len(&self, ip_header_size: usize, tcp_header_size: usize) -> usize {
+    pub fn calculate_payload_max_len(
+        &self,
+        ip_header_size: usize,
+        tcp_header_size: usize,
+    ) -> usize {
         let send_window = self.get_send_window() as usize;
         let mtu = self.get_mtu() as usize;
-        std::cmp::min(send_window, mtu.saturating_sub(ip_header_size + tcp_header_size))
+        std::cmp::min(
+            send_window,
+            mtu.saturating_sub(ip_header_size + tcp_header_size),
+        )
     }
 
     pub fn update_duplicate_ack_count(&mut self, rcvd_ack: SeqNum) {
@@ -122,12 +129,23 @@ impl Tcb {
             let overlap = self.ack.distance(seq) as usize;
             if overlap >= buf.len() {
                 // Entire packet already acknowledged, nothing new
-                trace!("{:?}: Received fully acked retransmit seq {seq}, self ack {}, len = {}", self.state, self.ack, buf.len());
+                trace!(
+                    "{:?}: Received fully acked retransmit seq {seq}, self ack {}, len = {}",
+                    self.state,
+                    self.ack,
+                    buf.len()
+                );
                 return;
             }
             // Trim the already-acknowledged prefix and insert only new data
-            trace!("{:?}: Trimming overlapping retransmit seq {seq} -> {}, overlap = {overlap}, len = {}", self.state, self.ack, buf.len());
-            self.unordered_packets.insert(self.ack, buf[overlap..].to_vec());
+            trace!(
+                "{:?}: Trimming overlapping retransmit seq {seq} -> {}, overlap = {overlap}, len = {}",
+                self.state,
+                self.ack,
+                buf.len()
+            );
+            self.unordered_packets
+                .insert(self.ack, buf[overlap..].to_vec());
             return;
         }
         self.unordered_packets.insert(seq, buf);
@@ -247,7 +265,10 @@ impl Tcb {
                         PacketType::KeepAlive
                     } else if !payload.is_empty() {
                         PacketType::NewPacket
-                    } else if self.get_send_window() == rcvd_window_scaled && self.seq != rcvd_ack && self.is_duplicate_ack_count_exceeded() {
+                    } else if self.get_send_window() == rcvd_window_scaled
+                        && self.seq != rcvd_ack
+                        && self.is_duplicate_ack_count_exceeded()
+                    {
                         PacketType::RetransmissionRequest
                     } else {
                         PacketType::WindowUpdate
@@ -269,10 +290,14 @@ impl Tcb {
 
     pub(super) fn add_inflight_packet(&mut self, buf: Vec<u8>) -> std::io::Result<()> {
         if buf.is_empty() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Empty payload"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Empty payload",
+            ));
         }
         let buf_len = buf.len() as u32;
-        self.inflight_packets.insert(self.seq, InflightPacket::new(self.seq, buf));
+        self.inflight_packets
+            .insert(self.seq, InflightPacket::new(self.seq, buf));
         self.seq += buf_len;
         Ok(())
     }
@@ -301,7 +326,8 @@ impl Tcb {
                 self.inflight_packets.insert(ack, inflight_packet);
             }
         }
-        self.inflight_packets.retain(|_, p| ack < p.seq + p.payload.len() as u32);
+        self.inflight_packets
+            .retain(|_, p| ack < p.seq + p.payload.len() as u32);
     }
 
     pub(crate) fn find_inflight_packet(&self, seq: SeqNum) -> Option<&InflightPacket> {
@@ -314,7 +340,10 @@ impl Tcb {
 
         self.inflight_packets.retain(|_, packet| {
             if packet.retransmit_count >= MAX_RETRANSMIT_COUNT {
-                warn!("Packet with seq {:?} reached max retransmit count, dropping packet", packet.seq);
+                warn!(
+                    "Packet with seq {:?} reached max retransmit count, dropping packet",
+                    packet.seq
+                );
                 return false; // remove this packet
             }
             if packet.is_timed_out() {
@@ -329,7 +358,10 @@ impl Tcb {
     }
 
     pub(crate) fn get_inflight_packets_total_len(&self) -> usize {
-        self.inflight_packets.values().map(|p| p.payload.len()).sum()
+        self.inflight_packets
+            .values()
+            .map(|p| p.payload.len())
+            .sum()
     }
 
     #[allow(dead_code)]
@@ -468,7 +500,13 @@ mod tests {
         // Simulate retransmission timeouts
         for i in 0..MAX_RETRANSMIT_COUNT {
             // Simulate a timeout for the first packet
-            let timeout = tcb.inflight_packets.values().next().unwrap().retransmit_timeout + std::time::Duration::from_millis(100);
+            let timeout = tcb
+                .inflight_packets
+                .values()
+                .next()
+                .unwrap()
+                .retransmit_timeout
+                + std::time::Duration::from_millis(100);
             println!("timeout: {timeout:?}");
             std::thread::sleep(timeout);
 

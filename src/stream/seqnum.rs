@@ -135,7 +135,11 @@ impl SubAssign<u32> for SeqNum {
 impl SeqNum {
     pub fn distance(&self, other: Self) -> u32 {
         let diff = self.0.wrapping_sub(other.0);
-        if diff <= MAX_DIFF { diff } else { u32::MAX - diff + 1 }
+        if diff <= MAX_DIFF {
+            diff
+        } else {
+            u32::MAX - diff + 1
+        }
     }
 }
 

@@ -3,10 +3,10 @@ use std::net::SocketAddr;
 pub use self::tcp::IpStackTcpStream;
 pub use self::udp::IpStackUdpStream;
 
+pub mod seqnum;
 pub mod tcb;
 pub mod tcp;
 pub mod udp;
-pub mod seqnum;
 
 pub enum IpStackStream {
     Tcp(IpStackTcpStream),

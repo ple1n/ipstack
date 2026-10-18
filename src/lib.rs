@@ -117,7 +117,7 @@ impl IpStack {
             let streams: Arc<DashMap<NetworkTuple, PacketSender>> = DashMap::new().into();
 
             let (pkt_sender, pkt_receiver) = make_packet_channel();
-            let pkt_sender2 = pkt_sender.clone();            
+            let pkt_sender2 = pkt_sender.clone();
             // This only applies to linux. see multi-queue
             const CONCURRENCY: usize = 1;
 
@@ -169,28 +169,32 @@ impl IpStack {
                                     // Try dispatching to existing stream.
                                     // Release the DashMap read-lock before any write operation.
                                     let packet = match streams.get(&tuple) {
-                                        Some(sender_ref) => {
-                                            match sender_ref.send(packet) {
-                                                Ok(_) => {
-                                                    trace!("known {}", &tuple);
+                                        Some(sender_ref) => match sender_ref.send(packet) {
+                                            Ok(_) => {
+                                                trace!("known {}", &tuple);
+                                                continue;
+                                            }
+                                            Err(send_err) => {
+                                                drop(sender_ref);
+                                                streams.remove(&tuple);
+                                                let packet = send_err.0;
+                                                if is_tcp && !is_tcp_syn {
+                                                    trace!(
+                                                        "stream dead, discarding non-SYN packet for {:?}",
+                                                        &tuple
+                                                    );
                                                     continue;
                                                 }
-                                                Err(send_err) => {
-                                                    drop(sender_ref);
-                                                    streams.remove(&tuple);
-                                                    let packet = send_err.0;
-                                                    if is_tcp && !is_tcp_syn {
-                                                        trace!("stream dead, discarding non-SYN packet for {:?}", &tuple);
-                                                        continue;
-                                                    }
-                                                    warn!("stream dead, recreating {:?}", &tuple);
-                                                    packet
-                                                }
+                                                warn!("stream dead, recreating {:?}", &tuple);
+                                                packet
                                             }
-                                        }
+                                        },
                                         None => {
                                             if is_tcp && !is_tcp_syn {
-                                                trace!("no stream, discarding non-SYN TCP packet for {:?}", &tuple);
+                                                trace!(
+                                                    "no stream, discarding non-SYN TCP packet for {:?}",
+                                                    &tuple
+                                                );
                                                 continue;
                                             }
                                             packet
@@ -201,7 +205,7 @@ impl IpStack {
                                     let tuple = packet.network_tuple();
                                     let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
                                     trace!("new {}", &tuple);
-                                    
+
                                     match packet.transport_header() {
                                         TransportHeader::Tcp(h) => {
                                             match IpStackTcpStream::new(
@@ -235,9 +239,7 @@ impl IpStack {
                                                 Some(tx),
                                             );
                                             streams.insert(tuple, stream.stream_sender());
-                                            stream_sx
-                                                .send(IpStackStream::Udp(stream))
-                                                .unwrap();
+                                            stream_sx.send(IpStackStream::Udp(stream)).unwrap();
                                         }
                                         TransportHeader::Unknown => {
                                             info!("unsupported transport protocol");
@@ -288,7 +290,7 @@ impl IpStack {
 
                     futures::join!(send_to_dev, from_dev)
                 };
-            let pkt_sender=  pkt_sender2.clone();
+            let pkt_sender = pkt_sender2.clone();
             single_dev(device, streams, pkt_receiver, pkt_sender, accept_sender).await
 
             // let mut fut = vec![];
