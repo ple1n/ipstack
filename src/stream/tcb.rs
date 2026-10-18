@@ -1,6 +1,7 @@
 use super::seqnum::SeqNum;
 use etherparse::TcpHeader;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 use tracing::*;
 
 const MAX_UNACK: u32 = 1024 * 512; // 512KB
@@ -53,7 +54,11 @@ pub(crate) struct Tcb {
     send_window: u32,
     state: TcpState,
     inflight_packets: BTreeMap<SeqNum, InflightPacket>,
+    inflight_packets_total_len: usize,
+    retransmission_deadlines: BTreeSet<(Instant, SeqNum)>,
+    pending_inflight_drops: BTreeSet<SeqNum>,
     unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
+    unordered_packets_total_len: usize,
     duplicate_ack_count: usize,
     duplicate_ack_count_helper: SeqNum,
     /// Window scale shift count for the send direction (remote's scale, applied to incoming window_size)
@@ -89,7 +94,11 @@ impl Tcb {
             send_window: u16::MAX as u32,
             state: TcpState::Listen,
             inflight_packets: BTreeMap::new(),
+            inflight_packets_total_len: 0,
+            retransmission_deadlines: BTreeSet::new(),
+            pending_inflight_drops: BTreeSet::new(),
             unordered_packets: BTreeMap::new(),
+            unordered_packets_total_len: 0,
             duplicate_ack_count: 0,
             duplicate_ack_count_helper: seq.into(),
             send_window_shift: remote_window_shift,
@@ -144,18 +153,25 @@ impl Tcb {
                 self.ack,
                 buf.len()
             );
-            self.unordered_packets
-                .insert(self.ack, buf[overlap..].to_vec());
+            self.insert_unordered_packet(self.ack, buf[overlap..].to_vec());
             return;
         }
-        self.unordered_packets.insert(seq, buf);
+        self.insert_unordered_packet(seq, buf);
     }
+
+    fn insert_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
+        if let Some(previous) = self.unordered_packets.insert(seq, buf) {
+            self.unordered_packets_total_len -= previous.len();
+        }
+        self.unordered_packets_total_len += self.unordered_packets[&seq].len();
+    }
+
     pub(super) fn get_available_read_buffer_size(&self) -> usize {
         READ_BUFFER_SIZE.saturating_sub(self.get_unordered_packets_total_len())
     }
     #[inline]
     pub(crate) fn get_unordered_packets_total_len(&self) -> usize {
-        self.unordered_packets.values().map(|p| p.len()).sum()
+        self.unordered_packets_total_len
     }
 
     pub(super) fn consume_unordered_packets(&mut self, max_bytes: usize) -> Option<Vec<u8>> {
@@ -171,6 +187,7 @@ impl Tcb {
                 // remove and get the first packet
                 let mut payload = self.unordered_packets.remove(&seq).unwrap();
                 let payload_len = payload.len();
+                self.unordered_packets_total_len -= payload_len;
 
                 if payload_len <= remaining_bytes {
                     // current packet can be fully extracted
@@ -182,7 +199,7 @@ impl Tcb {
                     let remaining_payload = payload.split_off(remaining_bytes);
                     data.extend_from_slice(&payload);
                     self.ack += remaining_bytes as u32;
-                    self.unordered_packets.insert(self.ack, remaining_payload);
+                    self.insert_unordered_packet(self.ack, remaining_payload);
                     break;
                 }
             } else {
@@ -296,10 +313,38 @@ impl Tcb {
             ));
         }
         let buf_len = buf.len() as u32;
-        self.inflight_packets
-            .insert(self.seq, InflightPacket::new(self.seq, buf));
+        self.insert_inflight_packet(InflightPacket::new(self.seq, buf));
         self.seq += buf_len;
         Ok(())
+    }
+
+    fn insert_inflight_packet(&mut self, packet: InflightPacket) {
+        let seq = packet.seq;
+        if let Some(previous) = self.inflight_packets.insert(seq, packet) {
+            self.remove_inflight_indexes(&previous);
+            self.inflight_packets_total_len -= previous.payload.len();
+        }
+        let packet = &self.inflight_packets[&seq];
+        self.inflight_packets_total_len += packet.payload.len();
+        if packet.retransmit_count >= MAX_RETRANSMIT_COUNT {
+            self.pending_inflight_drops.insert(seq);
+        } else {
+            self.retransmission_deadlines
+                .insert((packet.retransmission_deadline(), seq));
+        }
+    }
+
+    fn remove_inflight_indexes(&mut self, packet: &InflightPacket) {
+        self.retransmission_deadlines
+            .remove(&(packet.retransmission_deadline(), packet.seq));
+        self.pending_inflight_drops.remove(&packet.seq);
+    }
+
+    fn remove_inflight_packet(&mut self, seq: SeqNum) -> Option<InflightPacket> {
+        let packet = self.inflight_packets.remove(&seq)?;
+        self.remove_inflight_indexes(&packet);
+        self.inflight_packets_total_len -= packet.payload.len();
+        Some(packet)
     }
 
     pub(super) fn update_last_received_ack(&mut self, ack: SeqNum) {
@@ -312,22 +357,29 @@ impl Tcb {
             Some((&seq, _)) if ack < seq => return,
             _ => {}
         }
-        if let Some(seq) = self
+
+        let partial_seq = self
             .inflight_packets
-            .iter()
-            .find(|(_, p)| p.contains_seq_num(ack - 1))
-            .map(|(&s, _)| s)
-        {
-            let mut inflight_packet = self.inflight_packets.remove(&seq).unwrap();
+            .range(..=ack - 1)
+            .next_back()
+            .and_then(|(&seq, packet)| packet.contains_seq_num(ack - 1).then_some(seq));
+
+        if let Some(seq) = partial_seq {
+            let mut inflight_packet = self.remove_inflight_packet(seq).unwrap();
             let distance = ack.distance(inflight_packet.seq) as usize;
             if distance < inflight_packet.payload.len() {
                 inflight_packet.payload.drain(0..distance);
                 inflight_packet.seq = ack;
-                self.inflight_packets.insert(ack, inflight_packet);
+                self.insert_inflight_packet(inflight_packet);
             }
         }
-        self.inflight_packets
-            .retain(|_, p| ack < p.seq + p.payload.len() as u32);
+
+        let acknowledged = self.inflight_packets.split_off(&ack);
+        let acknowledged = std::mem::replace(&mut self.inflight_packets, acknowledged);
+        for (_, packet) in acknowledged {
+            self.remove_inflight_indexes(&packet);
+            self.inflight_packets_total_len -= packet.payload.len();
+        }
     }
 
     pub(crate) fn find_inflight_packet(&self, seq: SeqNum) -> Option<&InflightPacket> {
@@ -336,32 +388,56 @@ impl Tcb {
 
     #[must_use]
     pub(crate) fn collect_timed_out_inflight_packets(&mut self) -> Vec<InflightPacket> {
+        self.collect_timed_out_inflight_packets_at(Instant::now())
+    }
+
+    fn collect_timed_out_inflight_packets_at(&mut self, now: Instant) -> Vec<InflightPacket> {
+        let pending_drops = std::mem::take(&mut self.pending_inflight_drops);
+        for seq in pending_drops {
+            if let Some(packet) = self.inflight_packets.remove(&seq) {
+                self.inflight_packets_total_len -= packet.payload.len();
+            }
+        }
+
         let mut retransmit_list = Vec::new();
 
-        self.inflight_packets.retain(|_, packet| {
+        while let Some(&(deadline, seq)) = self.retransmission_deadlines.first() {
+            if deadline > now {
+                break;
+            }
+            self.retransmission_deadlines.remove(&(deadline, seq));
+            let Some(packet) = self.inflight_packets.get_mut(&seq) else {
+                continue;
+            };
+            if packet.retransmission_deadline() != deadline {
+                continue;
+            }
             if packet.retransmit_count >= MAX_RETRANSMIT_COUNT {
                 warn!(
                     "Packet with seq {:?} reached max retransmit count, dropping packet",
                     packet.seq
                 );
-                return false; // remove this packet
+                self.remove_inflight_packet(seq);
+                continue;
             }
-            if packet.is_timed_out() {
-                packet.retransmit_count += 1;
-                packet.retransmit_timeout *= 2; // increase timeout exponentially
-                packet.send_time = std::time::Instant::now();
-                retransmit_list.push(packet.clone());
+
+            packet.retransmit_count += 1;
+            packet.retransmit_timeout *= 2;
+            packet.send_time = now;
+            let next_deadline = packet.retransmission_deadline();
+            let exhausted = packet.retransmit_count >= MAX_RETRANSMIT_COUNT;
+            retransmit_list.push(packet.clone());
+            if exhausted {
+                self.pending_inflight_drops.insert(seq);
+            } else {
+                self.retransmission_deadlines.insert((next_deadline, seq));
             }
-            true // keep the packet in the inflight_packets
-        });
+        }
         retransmit_list
     }
 
     pub(crate) fn get_inflight_packets_total_len(&self) -> usize {
-        self.inflight_packets
-            .values()
-            .map(|p| p.payload.len())
-            .sum()
+        self.inflight_packets_total_len
     }
 
     #[allow(dead_code)]
@@ -398,8 +474,8 @@ impl InflightPacket {
     pub(crate) fn contains_seq_num(&self, seq: SeqNum) -> bool {
         self.seq <= seq && seq < self.seq + self.payload.len() as u32
     }
-    pub(crate) fn is_timed_out(&self) -> bool {
-        self.send_time.elapsed() >= self.retransmit_timeout
+    fn retransmission_deadline(&self) -> Instant {
+        self.send_time + self.retransmit_timeout
     }
 }
 
@@ -428,6 +504,7 @@ mod tests {
         tcb.add_unordered_packet(SeqNum(1000), vec![1; 500]); // seq=1000, len=500
         tcb.add_unordered_packet(SeqNum(1500), vec![2; 500]); // seq=1500, len=500
         tcb.add_unordered_packet(SeqNum(2000), vec![3; 500]); // seq=2000, len=500
+        assert_eq!(tcb.get_unordered_packets_total_len(), 1500);
 
         // test 1: extract up to 700 bytes
         let data = tcb.consume_unordered_packets(700).unwrap();
@@ -438,6 +515,7 @@ mod tests {
         assert_eq!(tcb.unordered_packets.len(), 2); // remaining two packets
         assert_eq!(tcb.unordered_packets.get(&SeqNum(1700)).unwrap().len(), 300); // the second packet remaining 300 bytes
         assert_eq!(tcb.unordered_packets.get(&SeqNum(2000)).unwrap().len(), 500); // the third packet unchanged
+        assert_eq!(tcb.get_unordered_packets_total_len(), 800);
 
         // test 2: extract up to 800 bytes
         let data = tcb.consume_unordered_packets(800).unwrap();
@@ -446,10 +524,33 @@ mod tests {
         assert_eq!(data[300..800], vec![3; 500]); // the third packet
         assert_eq!(tcb.ack, SeqNum(2500)); // ack increased by 800
         assert_eq!(tcb.unordered_packets.len(), 0); // no remaining packets
+        assert_eq!(tcb.get_unordered_packets_total_len(), 0);
 
         // test 3: no data to extract
         let data = tcb.consume_unordered_packets(1000);
         assert!(data.is_none());
+    }
+
+    #[test]
+    fn test_unordered_packet_total_len_tracks_replacements_and_consumption() {
+        let mut tcb = Tcb::new(SeqNum(100), 1500, 0);
+        tcb.add_unordered_packet(SeqNum(100), vec![1; 5]);
+        tcb.add_unordered_packet(SeqNum(100), vec![2; 3]);
+        assert_eq!(tcb.get_unordered_packets_total_len(), 3);
+
+        tcb.add_unordered_packet(SeqNum(98), vec![3; 5]);
+        assert_eq!(tcb.get_unordered_packets_total_len(), 3);
+        assert_eq!(
+            tcb.unordered_packets.get(&SeqNum(100)).unwrap(),
+            &vec![3; 3]
+        );
+
+        tcb.add_unordered_packet(SeqNum(98), vec![4; 1]);
+        assert_eq!(tcb.get_unordered_packets_total_len(), 3);
+        assert_eq!(tcb.consume_unordered_packets(2).unwrap(), vec![3; 2]);
+        assert_eq!(tcb.get_unordered_packets_total_len(), 1);
+        assert_eq!(tcb.consume_unordered_packets(2).unwrap(), vec![3; 1]);
+        assert_eq!(tcb.get_unordered_packets_total_len(), 0);
     }
 
     #[test]
@@ -461,6 +562,7 @@ mod tests {
         tcb.add_inflight_packet(vec![1; 500]).unwrap(); // seq=100, len=500
         tcb.add_inflight_packet(vec![2; 500]).unwrap(); // seq=600, len=500
         tcb.add_inflight_packet(vec![3; 500]).unwrap(); // seq=1100, len=500
+        assert_eq!(tcb.get_inflight_packets_total_len(), 1500);
 
         // test 1: confirm partial packets (ack=800)
         tcb.update_inflight_packet_queue(SeqNum(800));
@@ -470,10 +572,12 @@ mod tests {
         assert_eq!(first_packet.payload.len(), 300); // remaining 300 bytes in the first packet
         let second_packet = tcb.inflight_packets.last_key_value().unwrap().1;
         assert_eq!(second_packet.seq, SeqNum(1100)); // no change in the second packet
+        assert_eq!(tcb.get_inflight_packets_total_len(), 800);
 
         // test 2: confirm all packets (ack=2000)
         tcb.update_inflight_packet_queue(SeqNum(2000));
         assert_eq!(tcb.inflight_packets.len(), 0); // all packets are acknowledged
+        assert_eq!(tcb.get_inflight_packets_total_len(), 0);
     }
 
     #[test]
@@ -489,6 +593,32 @@ mod tests {
         // Emulate cumulative ACK: ack=2500
         tcb.update_inflight_packet_queue(SeqNum(2500));
         assert_eq!(tcb.inflight_packets.len(), 0); // all packets should be removed
+        assert_eq!(tcb.get_inflight_packets_total_len(), 0);
+    }
+
+    #[test]
+    fn test_update_inflight_packet_queue_across_sequence_wrap() {
+        let mut tcb = Tcb::new(SeqNum(0), 1500, 0);
+        tcb.seq = SeqNum(u32::MAX - 9);
+        tcb.add_inflight_packet(vec![1; 10]).unwrap();
+        tcb.add_inflight_packet(vec![2; 10]).unwrap();
+        tcb.add_inflight_packet(vec![3; 10]).unwrap();
+
+        tcb.update_inflight_packet_queue(SeqNum(5));
+        assert_eq!(tcb.inflight_packets.len(), 2);
+        assert_eq!(
+            tcb.inflight_packets.first_key_value().unwrap().0,
+            &SeqNum(5)
+        );
+        assert_eq!(
+            tcb.inflight_packets.first_key_value().unwrap().1.payload,
+            vec![2; 5]
+        );
+        assert_eq!(tcb.get_inflight_packets_total_len(), 15);
+
+        tcb.update_inflight_packet_queue(SeqNum(15));
+        assert_eq!(tcb.inflight_packets.len(), 1);
+        assert_eq!(tcb.get_inflight_packets_total_len(), 5);
     }
 
     #[test]
@@ -497,28 +627,27 @@ mod tests {
 
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
 
-        // Simulate retransmission timeouts
-        for i in 0..MAX_RETRANSMIT_COUNT {
-            // Simulate a timeout for the first packet
-            let timeout = tcb
-                .inflight_packets
-                .values()
-                .next()
-                .unwrap()
-                .retransmit_timeout
-                + std::time::Duration::from_millis(100);
-            println!("timeout: {timeout:?}");
-            std::thread::sleep(timeout);
+        let first_packet = tcb.inflight_packets.first_key_value().unwrap().1;
+        let mut now = first_packet.retransmission_deadline();
 
-            let packets = tcb.collect_timed_out_inflight_packets();
+        assert!(
+            tcb.collect_timed_out_inflight_packets_at(now - std::time::Duration::from_millis(1))
+                .is_empty()
+        );
+
+        // Simulate retransmission timeouts without waiting on wall-clock time.
+        for i in 0..MAX_RETRANSMIT_COUNT {
+            let packets = tcb.collect_timed_out_inflight_packets_at(now);
             assert_eq!(packets.len(), 1);
             let packet = &packets[0];
             assert_eq!(packet.retransmit_count, i + 1);
             assert!(packet.retransmit_timeout > RTO);
+            now = packet.retransmission_deadline();
         }
 
-        let packets = tcb.collect_timed_out_inflight_packets();
+        let packets = tcb.collect_timed_out_inflight_packets_at(now);
         assert!(packets.is_empty());
         assert!(tcb.inflight_packets.is_empty());
+        assert_eq!(tcb.get_inflight_packets_total_len(), 0);
     }
 }
