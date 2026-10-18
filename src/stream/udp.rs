@@ -215,6 +215,7 @@ impl Drop for IpStackUdpStream {
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn write_datagram_from_uses_reported_source_and_local_destination() {
@@ -241,6 +242,29 @@ mod tests {
 
         let packet = receiver.try_recv().unwrap();
         assert_eq!(packet.src_addr(), reported_remote);
+        assert_eq!(packet.dst_addr(), local_addr);
+        assert_eq!(packet.payload.as_deref(), Some(&b"reply"[..]));
+    }
+
+    #[tokio::test]
+    async fn write_uses_original_virtual_peer_as_reply_source() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let local_addr = SocketAddr::from_str("10.8.0.2:51257").unwrap();
+        let virtual_peer = SocketAddr::from_str("198.18.0.9:3478").unwrap();
+        let mut stream = IpStackUdpStream::new(
+            local_addr,
+            virtual_peer,
+            Vec::new(),
+            sender,
+            1500,
+            Duration::from_secs(30),
+            None,
+        );
+
+        stream.write_all(b"reply").await.unwrap();
+
+        let packet = receiver.try_recv().unwrap();
+        assert_eq!(packet.src_addr(), virtual_peer);
         assert_eq!(packet.dst_addr(), local_addr);
         assert_eq!(packet.payload.as_deref(), Some(&b"reply"[..]));
     }
