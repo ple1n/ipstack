@@ -34,6 +34,45 @@ impl IpStackUdpStream {
         timeout_interval: Duration,
         destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
     ) -> Self {
+        Self::new_inner(
+            src_addr,
+            dst_addr,
+            Some(payload),
+            up_pkt_sender,
+            mtu,
+            timeout_interval,
+            destroy_messenger,
+        )
+    }
+
+    pub(crate) fn new_client(
+        src_addr: SocketAddr,
+        dst_addr: SocketAddr,
+        up_pkt_sender: PacketSender,
+        mtu: u16,
+        timeout_interval: Duration,
+        destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
+    ) -> Self {
+        Self::new_inner(
+            src_addr,
+            dst_addr,
+            None,
+            up_pkt_sender,
+            mtu,
+            timeout_interval,
+            destroy_messenger,
+        )
+    }
+
+    fn new_inner(
+        src_addr: SocketAddr,
+        dst_addr: SocketAddr,
+        first_payload: Option<Vec<u8>>,
+        up_pkt_sender: PacketSender,
+        mtu: u16,
+        timeout_interval: Duration,
+        destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
+    ) -> Self {
         let (stream_sender, stream_receiver) = mpsc::unbounded_channel::<NetworkPacket>();
         let deadline = tokio::time::Instant::now() + timeout_interval;
         IpStackUdpStream {
@@ -42,7 +81,7 @@ impl IpStackUdpStream {
             stream_sender,
             stream_receiver,
             up_pkt_sender,
-            first_payload: Some(payload),
+            first_payload,
             timeout: Box::pin(tokio::time::sleep_until(deadline)),
             timeout_interval,
             mtu,
@@ -54,14 +93,15 @@ impl IpStackUdpStream {
         self.stream_sender.clone()
     }
 
-    fn create_rev_packet(
+    fn create_packet(
         &self,
-        remote_addr: SocketAddr,
+        src_addr: SocketAddr,
+        dst_addr: SocketAddr,
         ttl: u8,
         mut payload: Vec<u8>,
     ) -> std::io::Result<NetworkPacket> {
         const UHS: usize = 8; // udp header size is 8
-        match (remote_addr.ip(), self.src_addr.ip()) {
+        match (src_addr.ip(), dst_addr.ip()) {
             (std::net::IpAddr::V4(src), std::net::IpAddr::V4(dst)) => {
                 let mut ip_h = Ipv4Header::new(0, ttl, IpNumber::UDP, src.octets(), dst.octets())
                     .map_err(IpStackError::from)?;
@@ -70,8 +110,8 @@ impl IpStackUdpStream {
                 ip_h.set_payload_len(payload.len() + UHS)
                     .map_err(IpStackError::from)?;
                 let udp_header = UdpHeader::with_ipv4_checksum(
-                    remote_addr.port(),
-                    self.src_addr.port(),
+                    src_addr.port(),
+                    dst_addr.port(),
                     &ip_h,
                     &payload,
                 )
@@ -98,8 +138,8 @@ impl IpStackUdpStream {
 
                 ip_h.payload_length = (payload.len() + UHS) as u16;
                 let udp_header = UdpHeader::with_ipv6_checksum(
-                    remote_addr.port(),
-                    self.src_addr.port(),
+                    src_addr.port(),
+                    dst_addr.port(),
                     &ip_h,
                     &payload,
                 )
@@ -127,12 +167,35 @@ impl IpStackUdpStream {
         payload: &[u8],
     ) -> std::io::Result<usize> {
         self.reset_timeout();
-        let packet = self.create_rev_packet(remote_addr, TTL, payload.to_vec())?;
+        let packet = self.create_packet(remote_addr, self.src_addr, TTL, payload.to_vec())?;
         let payload_len = packet.payload.as_ref().map_or(0, Vec::len);
         self.up_pkt_sender
             .send(packet)
             .map_err(|_| std::io::ErrorKind::UnexpectedEof)?;
         Ok(payload_len)
+    }
+
+    pub fn send_datagram(&mut self, payload: &[u8]) -> std::io::Result<usize> {
+        self.reset_timeout();
+        let packet = self.create_packet(self.src_addr, self.dst_addr, TTL, payload.to_vec())?;
+        let payload_len = packet.payload.as_ref().map_or(0, Vec::len);
+        self.up_pkt_sender
+            .send(packet)
+            .map_err(|_| std::io::ErrorKind::UnexpectedEof)?;
+        Ok(payload_len)
+    }
+
+    pub async fn recv_datagram(&mut self) -> std::io::Result<(SocketAddr, Vec<u8>)> {
+        let packet = tokio::select! {
+            _ = self.timeout.as_mut() => {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+            }
+            packet = self.stream_receiver.recv() => {
+                packet.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?
+            }
+        };
+        self.reset_timeout();
+        Ok((packet.src_addr(), packet.payload.unwrap_or_default()))
     }
 
     pub fn local_addr(&self) -> SocketAddr {

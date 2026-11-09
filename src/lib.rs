@@ -49,6 +49,12 @@ struct TcpConnectRequest {
     result: tokio::sync::oneshot::Sender<Result<IpStackTcpStream, IpStackError>>,
 }
 
+struct UdpConnectRequest {
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
+    result: tokio::sync::oneshot::Sender<Result<IpStackUdpStream, IpStackError>>,
+}
+
 /// Exchanges complete IP packets with the stack.
 ///
 /// Packets are passed without an Ethernet header. On non-Windows targets, when
@@ -159,6 +165,13 @@ impl IpStackConfig {
 pub struct IpStack {
     accept_receiver: UnboundedReceiver<IpStackStream>,
     connect_sender: UnboundedSender<TcpConnectRequest>,
+    udp_connect_sender: UnboundedSender<UdpConnectRequest>,
+}
+
+#[derive(Clone)]
+pub struct IpStackHandle {
+    connect_sender: UnboundedSender<TcpConnectRequest>,
+    udp_connect_sender: UnboundedSender<UdpConnectRequest>,
 }
 
 impl IpStack {
@@ -170,6 +183,8 @@ impl IpStack {
     pub fn new_with_packet_io<D: PacketIo>(config: IpStackConfig, device: D) -> IpStack {
         let (accept_sender, accept_receiver) = mpsc::unbounded_channel::<IpStackStream>();
         let (connect_sender, mut connect_receiver) = mpsc::unbounded_channel::<TcpConnectRequest>();
+        let (udp_connect_sender, mut udp_connect_receiver) =
+            mpsc::unbounded_channel::<UdpConnectRequest>();
         let config2 = config.clone();
         let device = Arc::new(device);
         tokio::spawn(async move {
@@ -181,6 +196,44 @@ impl IpStack {
             let connect_packet_sender = pkt_sender.clone();
             let connect_mtu = config.mtu;
             let connect_config = config.tcp_config.clone();
+            let udp_connect_streams = streams.clone();
+            let udp_connect_packet_sender = pkt_sender.clone();
+            let udp_connect_mtu = config.mtu;
+            let udp_timeout = config.udp_timeout;
+            tokio::spawn(async move {
+                while let Some(request) = udp_connect_receiver.recv().await {
+                    let tuple = NetworkTuple::new(request.peer_addr, request.local_addr, false);
+                    let (destroy_sender, destroy_receiver) = tokio::sync::oneshot::channel();
+                    let stream = IpStackUdpStream::new_client(
+                        request.local_addr,
+                        request.peer_addr,
+                        udp_connect_packet_sender.clone(),
+                        udp_connect_mtu,
+                        udp_timeout,
+                        Some(destroy_sender),
+                    );
+                    match udp_connect_streams.entry(tuple) {
+                        mapref::entry::Entry::Occupied(_) => {
+                            let _ =
+                                request
+                                    .result
+                                    .send(Err(IpStackError::IoError(io::Error::new(
+                                        io::ErrorKind::AddrInUse,
+                                        "UDP flow already exists",
+                                    ))));
+                        }
+                        mapref::entry::Entry::Vacant(entry) => {
+                            entry.insert(stream.stream_sender());
+                            let streams = udp_connect_streams.clone();
+                            tokio::spawn(async move {
+                                let _ = destroy_receiver.await;
+                                streams.remove(&tuple);
+                            });
+                            let _ = request.result.send(Ok(stream));
+                        }
+                    }
+                }
+            });
             tokio::spawn(async move {
                 while let Some(request) = connect_receiver.recv().await {
                     let tuple = NetworkTuple::new(request.peer_addr, request.local_addr, true);
@@ -342,7 +395,7 @@ impl IpStack {
 
                                     // Create and register a new stream
                                     let tuple = packet.network_tuple();
-                                    let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
+                                    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
                                     trace!("new {}", &tuple);
 
                                     match packet.transport_header() {
@@ -378,6 +431,11 @@ impl IpStack {
                                                 Some(tx),
                                             );
                                             streams.insert(tuple, stream.stream_sender());
+                                            let streams = streams.clone();
+                                            tokio::spawn(async move {
+                                                let _ = rx.await;
+                                                streams.remove(&tuple);
+                                            });
                                             stream_sx.send(IpStackStream::Udp(stream)).unwrap();
                                         }
                                         TransportHeader::Unknown => {
@@ -386,7 +444,9 @@ impl IpStack {
                                     }
                                 }
                                 Err(ex) => {
-                                    warn!("tun read {:?}", ex);
+                                    if ex.kind() != io::ErrorKind::TimedOut {
+                                        warn!("tun read {:?}", ex);
+                                    }
                                 }
                             }
                         }
@@ -422,7 +482,9 @@ impl IpStack {
                                 }
                             }
                             trace!("write {} to dev", packet_byte.len());
-                            dev_sx.send_packet(&packet_byte).await.unwrap();
+                            if let Err(error) = dev_sx.send_packet(&packet_byte).await {
+                                warn!("packet write to device failed: {error}");
+                            }
                         }
                         error!("device writer stopped");
                     };
@@ -449,12 +511,46 @@ impl IpStack {
         IpStack {
             accept_receiver,
             connect_sender,
+            udp_connect_sender,
+        }
+    }
+
+    pub fn handle(&self) -> IpStackHandle {
+        IpStackHandle {
+            connect_sender: self.connect_sender.clone(),
+            udp_connect_sender: self.udp_connect_sender.clone(),
         }
     }
 
     /// Initiates a TCP connection through this stack using the provided local and peer addresses.
     ///
     /// The local address supplies the source IP and port for packets sent through `PacketIo`.
+    pub async fn connect_tcp(
+        &self,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+    ) -> Result<IpStackTcpStream, IpStackError> {
+        self.handle().connect_tcp(local_addr, peer_addr).await
+    }
+
+    pub async fn connect_udp(
+        &self,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+    ) -> Result<IpStackUdpStream, IpStackError> {
+        self.handle().connect_udp(local_addr, peer_addr).await
+    }
+
+    pub async fn accept(&mut self) -> Result<IpStackStream, IpStackError> {
+        if let Some(s) = self.accept_receiver.recv().await {
+            Ok(s)
+        } else {
+            Err(IpStackError::AcceptError)
+        }
+    }
+}
+
+impl IpStackHandle {
     pub async fn connect_tcp(
         &self,
         local_addr: SocketAddr,
@@ -493,12 +589,43 @@ impl IpStack {
         })?
     }
 
-    pub async fn accept(&mut self) -> Result<IpStackStream, IpStackError> {
-        if let Some(s) = self.accept_receiver.recv().await {
-            Ok(s)
-        } else {
-            Err(IpStackError::AcceptError)
+    /// Creates a UDP flow through this stack using the provided local and peer addresses.
+    pub async fn connect_udp(
+        &self,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+    ) -> Result<IpStackUdpStream, IpStackError> {
+        if local_addr.is_ipv4() != peer_addr.is_ipv4()
+            || local_addr.port() == 0
+            || peer_addr.port() == 0
+            || local_addr.ip().is_unspecified()
+            || peer_addr.ip().is_unspecified()
+        {
+            return Err(IpStackError::IoError(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "UDP flow requires concrete, nonzero local and peer addresses",
+            )));
         }
+
+        let (result, receiver) = tokio::sync::oneshot::channel();
+        self.udp_connect_sender
+            .send(UdpConnectRequest {
+                local_addr,
+                peer_addr,
+                result,
+            })
+            .map_err(|_| {
+                IpStackError::IoError(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "IP stack UDP connection manager stopped",
+                ))
+            })?;
+        receiver.await.map_err(|_| {
+            IpStackError::IoError(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "IP stack dropped the UDP flow request",
+            ))
+        })?
     }
 }
 
@@ -509,6 +636,7 @@ mod tests {
         packet::{TransportHeader, tcp_header_flags},
         stream::tcp::{TcpOptions, create_raw_packet},
     };
+    use etherparse::{IpNumber, Ipv4Header, UdpHeader};
     use tokio::sync::Mutex;
 
     struct ChannelPacketIo {
@@ -734,5 +862,78 @@ mod tests {
             IpStackError::IoError(ref io_error)
                 if io_error.kind() == io::ErrorKind::ConnectionRefused
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn packet_io_supports_outbound_udp_and_routes_responses() {
+        let (peer_to_stack, peer_packets) = mpsc::unbounded_channel();
+        let (stack_to_peer, mut stack_packets) = mpsc::unbounded_channel();
+        let stack = IpStack::new_with_packet_io(
+            IpStackConfig::default(),
+            ChannelPacketIo {
+                incoming: Mutex::new(peer_packets),
+                outgoing: stack_to_peer,
+            },
+        );
+        let local_addr = "10.0.0.2:40000".parse().unwrap();
+        let peer_addr = "203.0.113.1:53".parse().unwrap();
+        let mut flow = stack.connect_udp(local_addr, peer_addr).await.unwrap();
+
+        assert_eq!(flow.send_datagram(b"query").unwrap(), 5);
+        let request = tokio::time::timeout(Duration::from_secs(2), stack_packets.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let request = NetworkPacket::parse(&request).unwrap();
+        assert_eq!(request.src_addr(), local_addr);
+        assert_eq!(request.dst_addr(), peer_addr);
+        assert!(matches!(
+            request.transport_header(),
+            TransportHeader::Udp(_)
+        ));
+        assert_eq!(request.payload.as_deref(), Some(&b"query"[..]));
+
+        let response_payload = b"response";
+        let mut ip_header = Ipv4Header::new(
+            0,
+            TTL,
+            IpNumber::UDP,
+            peer_addr
+                .ip()
+                .to_string()
+                .parse::<std::net::Ipv4Addr>()
+                .unwrap()
+                .octets(),
+            local_addr
+                .ip()
+                .to_string()
+                .parse::<std::net::Ipv4Addr>()
+                .unwrap()
+                .octets(),
+        )
+        .unwrap();
+        ip_header
+            .set_payload_len(response_payload.len() + 8)
+            .unwrap();
+        let udp_header = UdpHeader::with_ipv4_checksum(
+            peer_addr.port(),
+            local_addr.port(),
+            &ip_header,
+            response_payload,
+        )
+        .unwrap();
+        let response = NetworkPacket {
+            ip: crate::packet::IpHeader::Ipv4(ip_header),
+            transport: TransportHeader::Udp(udp_header),
+            payload: Some(response_payload.to_vec()),
+        };
+        peer_to_stack.send(response.to_bytes().unwrap()).unwrap();
+
+        let (source, payload) = tokio::time::timeout(Duration::from_secs(2), flow.recv_datagram())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source, peer_addr);
+        assert_eq!(payload, response_payload);
     }
 }
