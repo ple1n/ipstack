@@ -48,4 +48,13 @@ async fn main(){
 }
 ````
 
+### Embedded packet I/O and outbound TCP
+
+`IpStack::new` remains the TUN-device entry point. Embedders can instead implement
+`PacketIo` to exchange raw IP packets with another transport and construct the stack
+with `IpStack::new_with_packet_io`. The same stack can initiate TCP connections with
+`connect_tcp(local_addr, peer_addr)`; the local address must be concrete, use a
+nonzero port, and match the peer's IP version. This returns the same
+`IpStackTcpStream` type used by accepted TUN connections.
+
 We also suggest that you take a look at the complete [examples](https://github.com/narrowlink/ipstack/tree/main/examples).

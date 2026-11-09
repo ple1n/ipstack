@@ -7,7 +7,7 @@ use crate::{
         tcp_flags::{ACK, FIN, PSH, RST, SYN},
         tcp_header_flags, tcp_header_fmt,
     },
-    stream::tcb::{PacketType, Tcb, TcpState},
+    stream::tcb::{MAX_RETRANSMIT_COUNT, PacketType, Tcb, TcpState},
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader, TcpOptionElement};
 use std::{
@@ -116,6 +116,7 @@ type TcbPtr = std::sync::Arc<std::sync::Mutex<Tcb>>;
 pub struct IpStackTcpStream {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
+    packet_tuple: NetworkTuple,
     stream_sender: PacketSender,
     stream_receiver: Option<PacketRecver>,
     up_packet_sender: PacketSender,
@@ -183,6 +184,7 @@ impl IpStackTcpStream {
         let mut stream = IpStackTcpStream {
             src_addr,
             dst_addr,
+            packet_tuple: tuple,
             stream_sender,
             stream_receiver: Some(stream_receiver),
             up_packet_sender,
@@ -207,8 +209,70 @@ impl IpStackTcpStream {
         let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
         debug!("{tuple} {state:?}: {l_info} session begins, total TCP sessions: {sessions}");
 
-        stream.spawn_tasks()?;
+        stream.spawn_tasks(None)?;
         Ok(stream)
+    }
+
+    pub(crate) fn new_client(
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        up_packet_sender: PacketSender,
+        mtu: u16,
+        config: Arc<TcpConfig>,
+    ) -> IpStackTcpStream {
+        let default_peer_mss = if peer_addr.is_ipv4() { 536 } else { 1220 };
+        let ip_header_size = if local_addr.is_ipv4() { 20 } else { 40 };
+        let path_mss = mtu.saturating_sub(ip_header_size + 20);
+        let configured_mss = config.options.as_ref().and_then(|options| {
+            options.iter().find_map(|option| match option {
+                TcpOptions::MaximumSegmentSize(mss) => Some(*mss),
+                _ => None,
+            })
+        });
+        let local_mss = configured_mss.unwrap_or(path_mss).min(path_mss);
+        let tcb = Tcb::new_client(mtu, default_peer_mss, local_mss);
+        let packet_tuple = NetworkTuple::new(peer_addr, local_addr, true);
+        let (stream_sender, stream_receiver) =
+            tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
+        let (data_tx, data_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let deadline = tokio::time::Instant::now() + config.timeout;
+
+        let stream = IpStackTcpStream {
+            src_addr: local_addr,
+            dst_addr: peer_addr,
+            packet_tuple,
+            stream_sender,
+            stream_receiver: Some(stream_receiver),
+            up_packet_sender,
+            tcb: std::sync::Arc::new(std::sync::Mutex::new(tcb)),
+            shutdown: std::sync::Arc::new(std::sync::Mutex::new(Shutdown::None)),
+            write_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            destroy_messenger: None,
+            timeout: Box::pin(tokio::time::sleep_until(deadline)),
+            data_tx,
+            data_rx,
+            read_notify: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            task_handle: None,
+            exit_notifier: None,
+            temp_read_buffer: Vec::new(),
+            config,
+        };
+        let sessions = SESSION_COUNTER
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_add(1);
+        debug!(
+            "{} SynSent: session begins, total TCP sessions: {sessions}",
+            stream.network_tuple()
+        );
+        stream
+    }
+
+    pub(crate) fn start_connect(
+        &mut self,
+    ) -> Result<tokio::sync::oneshot::Receiver<std::io::Result<()>>, std::io::Error> {
+        let (connect_sender, connect_receiver) = tokio::sync::oneshot::channel();
+        self.spawn_tasks(Some(connect_sender))?;
+        Ok(connect_receiver)
     }
 
     fn reset_timeout(&mut self) {
@@ -217,7 +281,7 @@ impl IpStackTcpStream {
     }
 
     pub(crate) fn network_tuple(&self) -> NetworkTuple {
-        NetworkTuple::new(self.src_addr, self.dst_addr, true)
+        self.packet_tuple
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -464,7 +528,10 @@ impl Drop for IpStackTcpStream {
 }
 
 impl IpStackTcpStream {
-    fn spawn_tasks(&mut self) -> std::io::Result<()> {
+    fn spawn_tasks(
+        &mut self,
+        connect_result: Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>,
+    ) -> std::io::Result<()> {
         let network_tuple = self.network_tuple();
 
         // task: data receiving and processing
@@ -494,6 +561,7 @@ impl IpStackTcpStream {
                 read_notify,
                 data_tx,
                 exit_monitor,
+                connect_result,
             )
             .await;
             if let Err(e) = &v {
@@ -522,36 +590,58 @@ async fn tcp_main_logic_loop(
     read_notify: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     data_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     mut exit_monitor: tokio::sync::mpsc::Receiver<()>,
+    mut connect_result: Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>,
 ) -> std::io::Result<()> {
+    let mut syn_sent_seq = None;
+    let mut syn_retries = 0;
+    let mut syn_retry = tokio::time::interval(Duration::from_secs(1));
+    syn_retry.tick().await;
     {
         let mut tcb = tcb.lock().unwrap();
 
         let state = tcb.get_state();
-        if state != TcpState::Listen {
-            warn!("{network_tuple} {state:?}: Invalid TCP state, not in Listen state");
-            return Ok::<(), std::io::Error>(());
+        match state {
+            TcpState::Listen => {
+                tcb.increase_ack();
+                let (seq, ack) = (tcb.get_seq().0, tcb.get_ack().0);
+                let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
+                trace!("{network_tuple} {state:?}: {l_info} session begins");
+                let mut synack_options: Vec<TcpOptions> =
+                    config.options.clone().unwrap_or_default();
+                synack_options.push(TcpOptions::WindowScale(tcb.get_recv_window_shift()));
+                write_packet_to_device(
+                    &up_packet_sender,
+                    network_tuple,
+                    &tcb,
+                    Some(&synack_options),
+                    ACK | SYN,
+                    None,
+                    None,
+                )?;
+                tcb.increase_seq();
+                tcb.change_state(TcpState::SynReceived);
+                let state = tcb.get_state();
+                trace!("{network_tuple} {state:?}: session now in {state:?} state");
+            }
+            TcpState::SynSent => {
+                let syn_options = client_syn_options(&config, &tcb, network_tuple.dst.ip());
+                syn_sent_seq = Some(tcb.get_seq());
+                write_packet_to_device(
+                    &up_packet_sender,
+                    network_tuple,
+                    &tcb,
+                    Some(&syn_options),
+                    SYN,
+                    None,
+                    None,
+                )?;
+                tcb.increase_seq();
+            }
+            _ => {
+                warn!("{network_tuple} {state:?}: Invalid initial TCP state");
+                return Ok::<(), std::io::Error>(());
+            }
         }
-
-        tcb.increase_ack();
-        let (seq, ack) = (tcb.get_seq().0, tcb.get_ack().0);
-        let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
-        trace!("{network_tuple} {state:?}: {l_info} session begins");
-        // Build SYN-ACK options: include user config options + our window scale
-        let mut synack_options: Vec<TcpOptions> = config.options.clone().unwrap_or_default();
-        synack_options.push(TcpOptions::WindowScale(tcb.get_recv_window_shift()));
-        write_packet_to_device(
-            &up_packet_sender,
-            network_tuple,
-            &tcb,
-            Some(&synack_options),
-            ACK | SYN,
-            None,
-            None,
-        )?;
-        tcb.increase_seq();
-        tcb.change_state(TcpState::SynReceived);
-        let state = tcb.get_state();
-        trace!("{network_tuple} {state:?}: session now in {state:?} state");
     }
 
     let tcb_clone = tcb.clone();
@@ -650,11 +740,53 @@ async fn tcp_main_logic_loop(
 
     loop {
         let exit_notifier = exit_notifier.clone();
+        let is_outbound = syn_sent_seq.is_some();
 
         let network_packet = tokio::select! {
             _ = exit_monitor.recv() => {
                 debug!("{network_tuple} task exited due to exit signal");
                 break;
+            }
+            _ = syn_retry.tick(), if is_outbound => {
+                let mut tcb = tcb.lock().unwrap();
+                if tcb.get_state() == TcpState::SynSent {
+                    if syn_retries >= MAX_RETRANSMIT_COUNT {
+                        tcb.change_state(TcpState::Closed);
+                        drop(tcb);
+                        if let Some(connect_result) = connect_result.take() {
+                            let _ = connect_result.send(Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "TCP connection timed out during handshake",
+                            )));
+                        }
+                        break;
+                    }
+                    let syn_options =
+                        client_syn_options(&config, &tcb, network_tuple.dst.ip());
+                    write_packet_to_device(
+                        &up_packet_sender,
+                        network_tuple,
+                        &tcb,
+                        Some(&syn_options),
+                        SYN,
+                        syn_sent_seq,
+                        None,
+                    )?;
+                    syn_retries += 1;
+                } else {
+                    for packet in tcb.collect_timed_out_inflight_packets() {
+                        write_packet_to_device(
+                            &up_packet_sender,
+                            network_tuple,
+                            &tcb,
+                            None,
+                            ACK | PSH,
+                            Some(packet.seq),
+                            Some(packet.payload),
+                        )?;
+                    }
+                }
+                continue;
             }
             network_packet = stream_receiver.recv() => network_packet,
         };
@@ -696,6 +828,58 @@ async fn tcp_main_logic_loop(
         if state == TcpState::Closed {
             debug!("{network_tuple} {state:?}: session finished, exiting task...");
             break;
+        }
+
+        if state == TcpState::SynSent {
+            if flags & RST == RST {
+                tcb.change_state(TcpState::Closed);
+                drop(tcb);
+                if let Some(connect_result) = connect_result.take() {
+                    let _ = connect_result.send(Err(std::io::Error::new(
+                        ConnectionRefused,
+                        "TCP connection was refused",
+                    )));
+                }
+                break;
+            }
+
+            if !tcp_header.syn || !tcp_header.ack || incoming_ack != tcb.get_seq() {
+                continue;
+            }
+
+            let remote_window_shift = tcp_header
+                .options_iterator()
+                .filter_map(|option| option.ok())
+                .fold((None, None), |(window_shift, mss), option| match option {
+                    TcpOptionElement::WindowScale(shift) => (Some(shift.min(14)), mss),
+                    TcpOptionElement::MaximumSegmentSize(mss) => (window_shift, Some(mss)),
+                    _ => (window_shift, mss),
+                });
+            let (remote_window_shift, remote_mss) = remote_window_shift;
+            let remote_window_shift = remote_window_shift.unwrap_or(0);
+            tcb.update_send_window_shift(remote_window_shift);
+            if let Some(remote_mss) = remote_mss {
+                tcb.update_peer_mss(remote_mss);
+            }
+            tcb.update_send_window(incoming_win);
+            tcb.update_last_received_ack(incoming_ack);
+            tcb.set_ack(incoming_seq);
+            tcb.increase_ack();
+            tcb.change_state(TcpState::Established);
+            write_packet_to_device(
+                &up_packet_sender,
+                network_tuple,
+                &tcb,
+                None,
+                ACK,
+                None,
+                None,
+            )?;
+            drop(tcb);
+            if let Some(connect_result) = connect_result.take() {
+                let _ = connect_result.send(Ok(()));
+            }
+            continue;
         }
 
         if flags & RST == RST {
@@ -1200,6 +1384,25 @@ pub(crate) fn write_packet_to_device(
         .send(packet)
         .map_err(|e| Error::new(UnexpectedEof, e))?;
     Ok(len)
+}
+
+fn client_syn_options(
+    config: &TcpConfig,
+    tcb: &Tcb,
+    local_ip: std::net::IpAddr,
+) -> Vec<TcpOptions> {
+    let mut options = config.options.clone().unwrap_or_default();
+    if !options
+        .iter()
+        .any(|option| matches!(option, TcpOptions::MaximumSegmentSize(_)))
+    {
+        let ip_header_size = if local_ip.is_ipv4() { 20 } else { 40 };
+        options.push(TcpOptions::MaximumSegmentSize(
+            tcb.get_mtu().saturating_sub(ip_header_size + 20),
+        ));
+    }
+    options.push(TcpOptions::WindowScale(tcb.get_recv_window_shift()));
+    options
 }
 
 #[allow(clippy::too_many_arguments)]

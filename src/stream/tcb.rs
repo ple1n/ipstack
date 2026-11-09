@@ -16,9 +16,8 @@ pub(crate) const MAX_RETRANSMIT_COUNT: usize = 3;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum TcpState {
-    // Init, /* Since we always act as a server, it starts from `Listen`, so we don't use states Init & SynSent. */
-    // SynSent,
     Listen,
+    SynSent,
     SynReceived,
     Established,
     FinWait1, // act as a client, actively send a farewell packet to the other side, followed with FinWait2, TimeWait, Closed
@@ -50,6 +49,7 @@ pub(crate) struct Tcb {
     seq: SeqNum,
     ack: SeqNum,
     mtu: u16,
+    peer_mss: usize,
     last_received_ack: SeqNum,
     send_window: u32,
     state: TcpState,
@@ -90,6 +90,7 @@ impl Tcb {
             seq: seq.into(),
             ack,
             mtu,
+            peer_mss: u16::MAX as usize,
             last_received_ack: seq.into(),
             send_window: u16::MAX as u32,
             state: TcpState::Listen,
@@ -106,6 +107,13 @@ impl Tcb {
         }
     }
 
+    pub(super) fn new_client(mtu: u16, peer_mss: u16, local_mss: u16) -> Tcb {
+        let mut tcb = Self::new(SeqNum(0), mtu, 0);
+        tcb.state = TcpState::SynSent;
+        tcb.peer_mss = (peer_mss as usize).min(local_mss as usize);
+        tcb
+    }
+
     pub fn calculate_payload_max_len(
         &self,
         ip_header_size: usize,
@@ -115,7 +123,8 @@ impl Tcb {
         let mtu = self.get_mtu() as usize;
         std::cmp::min(
             send_window,
-            mtu.saturating_sub(ip_header_size + tcp_header_size),
+            self.peer_mss
+                .min(mtu.saturating_sub(ip_header_size + tcp_header_size)),
         )
     }
 
@@ -219,11 +228,17 @@ impl Tcb {
     pub(super) fn increase_ack(&mut self) {
         self.ack += 1;
     }
+    pub(super) fn set_ack(&mut self, ack: SeqNum) {
+        self.ack = ack;
+    }
     pub(super) fn get_ack(&self) -> SeqNum {
         self.ack
     }
     pub(super) fn get_mtu(&self) -> u16 {
         self.mtu
+    }
+    pub(super) fn update_peer_mss(&mut self, mss: u16) {
+        self.peer_mss = self.peer_mss.min(mss as usize);
     }
     pub(super) fn get_last_received_ack(&self) -> SeqNum {
         self.last_received_ack
@@ -236,6 +251,9 @@ impl Tcb {
     }
     pub(super) fn update_send_window(&mut self, window: u16) {
         self.send_window = (window as u32) << self.send_window_shift;
+    }
+    pub(super) fn update_send_window_shift(&mut self, shift: u8) {
+        self.send_window_shift = shift.min(14);
     }
     pub(super) fn get_send_window(&self) -> u32 {
         self.send_window
